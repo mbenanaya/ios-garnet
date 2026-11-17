@@ -536,10 +536,13 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 	MTLPixelFormat _ycbcrFormat;        /* ... and the private format it was asked as (500, 540), which it answers */
 	void *_deallocBytes;
 	NSUInteger _deallocLength;
+	uint32_t _readAsKey[4];                 /* the texture through a stand-in's swizzle (hakiosTextureReadAs:), made once each */
+	hakios_metal_texture *_readAs[4];
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device texture:(hakios_metal_texture *)texture
 			  descriptor:(MTLTextureDescriptor *)descriptor usage:(MTLTextureUsage)usage;
 - (hakios_metal_texture *)hakiosTexture;
+- (hakios_metal_texture *)hakiosTextureReadAs:(uint32_t)swizzle;
 - (void)hakiosSetIOSurface:(IOSurfaceRef)surface plane:(NSUInteger)plane;
 - (void)hakiosShadow:(IOSurfaceRef)surface;
 - (BOOL)hakiosIsShadow;
@@ -1214,12 +1217,15 @@ HM_REFUSES_OUT_LOUD
 	unsigned char _specMask[256];
 	int _specMaskState;
 	BOOL _specFull;   /* told that it has 64 */
+	uint32_t _fsInputSwizzle;   /* a stand-in's: its first image read through this swizzle (hm_input_swizzle), 0 none */
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
 			  descriptor:(MTLRenderPipelineDescriptor *)descriptor;
 - (hakios_metal_program *)hakiosProgram;
 - (void)hakiosKeepFragment:(NSData *)air constants:(const hakios_metal_constant *)constants count:(unsigned)count;
 - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count;
+- (void)hakiosSetInputSwizzle:(uint32_t)swizzle;
+- (uint32_t)hakiosInputSwizzle;
 @end
 
 @interface HakiosMetalCommandQueue : _MTLCommandQueue {
@@ -1606,6 +1612,64 @@ hm_ca_nearest(NSString *frag)
 	return best;
 }
 
+/*
+ * What a fragment variant's first image input reads (the label's "_I..." after the varyings): the channels of its sample, as
+ * Apple's variants have them (the shufflevector after air.sample_texture in each of default.pipelinelib's functions):
+ * Isrc (r g b a), Ialp (a a a a), Igrn (g g g g), Ired (r r r r), Iblu (b b b b), Isrg (r r r g), Iara (a b g r),
+ * Isar (g r a b). A stand-in (hm_ca_nearest) that reads its image otherwise than the function asked -- TcimBcbnA2Xhf_Igrn
+ * by ..._Ialp, TcimBpldA2Xhf_Isrg by ..._Isrc -- is given its texture through a swizzle that turns its read into the one
+ * asked for: the home screen's delete badges, a grey-and-alpha image in RG8 (Isrg), were drawn as raw (r, g, 0, 1),
+ * opaque dark-green squares, and their circles (Igrn, alpha in green) as squares of alpha 1.
+ */
+static const struct {
+	const char *code;
+	unsigned char reads[4];
+} hm_input_codes[] = {
+	{ "Isrc", { 0, 1, 2, 3 } }, { "Ialp", { 3, 3, 3, 3 } }, { "Igrn", { 1, 1, 1, 1 } }, { "Ired", { 0, 0, 0, 0 } },
+	{ "Iblu", { 2, 2, 2, 2 } }, { "Isrg", { 0, 0, 0, 1 } }, { "Iara", { 3, 2, 1, 0 } }, { "Isar", { 1, 0, 3, 2 } },
+};
+static const unsigned char *
+hm_input_reads(NSString *label)
+{
+	NSRange at = [label rangeOfString:@"_I"];
+
+	if (at.location == NSNotFound || [label length] < at.location + 5) {
+		return NULL;
+	}
+	NSString *code = [label substringWithRange:NSMakeRange(at.location + 1, 4)];
+	for (unsigned i = 0; i < sizeof(hm_input_codes) / sizeof(hm_input_codes[0]); i++) {
+		if ([code isEqualToString:@(hm_input_codes[i].code)]) {
+			return hm_input_codes[i].reads;
+		}
+	}
+	return NULL;
+}
+/* the swizzle S, packed as four MTLTextureSwizzle values (red in the low byte), with S[have[i]] = want[i]; 0 when the two
+ * read the same, when either is not a plain selection of channels, or when no swizzle can make the one the other */
+static uint32_t
+hm_input_swizzle(NSString *want, NSString *have)
+{
+	const unsigned char *w = hm_input_reads(want), *h = hm_input_reads(have);
+	int map[4] = { -1, -1, -1, -1 };
+	uint32_t packed = 0;
+
+	if (w == NULL || h == NULL || memcmp(w, h, 4) == 0) {
+		return 0;
+	}
+	for (int i = 0; i < 4; i++) {
+		if (map[h[i]] >= 0 && map[h[i]] != w[i]) {
+			return 0;
+		}
+		map[h[i]] = w[i];
+	}
+	for (int c = 0; c < 4; c++) {
+		packed |= (uint32_t)(MTLTextureSwizzleRed + (map[c] >= 0 ? map[c] : c)) << (8 * c);
+	}
+	return packed;
+}
+/* the swizzle hm_bitcode_for found for the fragment function it was last asked for, on this thread */
+static __thread uint32_t hm_last_fs_swizzle;
+
 /* The module to compile for FUNCTION (of the pipeline labelled PIPELINE, vertex stage or not): its variant when
  * CoreAnimation's labels name one, else what the function itself has. */
 static NSData *
@@ -1651,6 +1715,9 @@ hm_bitcode_for(id function, NSString *pipeline, BOOL vertex)
 		}
 		return own;
 	}
+	if (!vertex) {
+		hm_last_fs_swizzle = 0;
+	}
 	if (name == nil || ![name hasPrefix:@"fixed_"]) {
 		return own;
 	}
@@ -1676,11 +1743,28 @@ hm_bitcode_for(id function, NSString *pipeline, BOOL vertex)
 		NSString *frag = under.location != NSNotFound ?
 			[@"com.apple.coreanimation.frag." stringByAppendingString:[spec substringFromIndex:NSMaxRange(under)]] : nil;
 
+		NSString *asked = frag;
+
 		if (frag != nil && hm_ca_variants[frag] == nil) {
 			frag = hm_ca_nearest(frag);
 		}
 		chosen = frag == nil ? nil : (vertex ? hm_ca_frag_vert[frag] : frag);
 		variant = chosen != nil ? hm_ca_variants[chosen] : nil;
+		if (!vertex && variant != nil && asked != nil && ![asked isEqualToString:chosen]) {
+			hm_last_fs_swizzle = hm_input_swizzle(asked, chosen);
+			if (hm_last_fs_swizzle != 0) {
+				static NSMutableSet *told;
+				@synchronized ([NSMutableSet class]) {
+					if (told == nil) told = [[NSMutableSet alloc] init];
+					if (![told containsObject:asked]) {
+						[told addObject:asked];
+						hm_print("CoreAnimation's %s: its stand-in reads its image through a swizzle (%u %u %u %u)\n",
+							 [asked UTF8String], hm_last_fs_swizzle & 0xff, (hm_last_fs_swizzle >> 8) & 0xff,
+							 (hm_last_fs_swizzle >> 16) & 0xff, hm_last_fs_swizzle >> 24);
+					}
+				}
+			}
+		}
 	}
 	if (variant == nil || said++ < 40) {
 		hm_print("CoreAnimation's %s (label %s, pipeline %s): %s%s\n", [name UTF8String], label ? [label UTF8String] : "none",
@@ -3194,6 +3278,7 @@ hm_describe_function(id f)
 	}
 	vsAir = hm_bitcode_for(vs, [descriptor label], YES);
 	fsAir = fs != nil ? hm_bitcode_for(fs, [descriptor label], NO) : nil;   /* nil: the built-in fragment function */
+	const uint32_t fsSwizzle = fs != nil ? hm_last_fs_swizzle : 0;
 	if (vsAir == nil || [vsAir length] == 0 || (fs != nil && (fsAir == nil || [fsAir length] == 0))) {
 		return [self hakiosRefuse:error what:"a render pipeline"
 				      why:[NSString stringWithFormat:@"%@ or %@ has no bitcode", [vs name], [fs name]]];
@@ -3307,6 +3392,7 @@ hm_describe_function(id f)
 		unsigned count = fs != nil ? hm_function_constants(fs, fc, 64) : 0;
 
 		if (state != nil && fsAir != nil) [state hakiosKeepFragment:fsAir constants:fc count:count];
+		if (state != nil && fsSwizzle != 0) [state hakiosSetInputSwizzle:fsSwizzle];
 		return state;
 	}
 }
@@ -4194,6 +4280,9 @@ HM_REFUSES_OUT_LOUD
 
 - (void)dealloc
 {
+	for (unsigned i = 0; i < 4; i++) {
+		if (_readAs[i] != NULL) hakios_metal_texture_free(_readAs[i]);
+	}
 	if (_texture != NULL && (_parent == nil || _ownsView)) {
 		hakios_metal_texture_free(_texture);   /* a command buffer still using it keeps its memory */
 	}
@@ -4214,6 +4303,28 @@ HM_REFUSES_OUT_LOUD
 }
 
 - (hakios_metal_texture *)hakiosTexture { return _texture; }
+
+/* the texture read through SWIZZLE (four MTLTextureSwizzle values, red in the low byte), the same memory; NULL when the core
+ * cannot make it (the texture as it is is then drawn) */
+- (hakios_metal_texture *)hakiosTextureReadAs:(uint32_t)swizzle
+{
+	@synchronized (self) {
+		for (unsigned i = 0; i < 4; i++) {
+			if (_readAs[i] != NULL && _readAsKey[i] == swizzle) {
+				return _readAs[i];
+			}
+		}
+		for (unsigned i = 0; i < 4; i++) {
+			if (_readAs[i] == NULL) {
+				_readAs[i] = hakios_metal_texture_new_swizzled(_texture, swizzle & 0xff, (swizzle >> 8) & 0xff, (swizzle >> 16) & 0xff,
+									       swizzle >> 24);
+				_readAsKey[i] = swizzle;
+				return _readAs[i];
+			}
+		}
+	}
+	return NULL;
+}
 
 - (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length
 {
@@ -7510,6 +7621,9 @@ hm_spec_off(void)
 /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
  * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 s on the host, and a frame
  * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own. */
+- (void)hakiosSetInputSwizzle:(uint32_t)swizzle { _fsInputSwizzle = swizzle; }
+- (uint32_t)hakiosInputSwizzle { return _fsInputSwizzle; }
+
 - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
 {
 	static dispatch_queue_t compiling;
@@ -8444,8 +8558,14 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	for (unsigned i = 0; i < _fsHighest; i++) {
 		fs[i] = _fsBuffers[i] != nil ? [_fsBuffers[i] hakiosBuffer] : NULL;
 	}
+	const uint32_t readAs = [_pipeline hakiosInputSwizzle];
 	for (unsigned i = 0; i < _fsHighestTexture; i++) {
 		fsTex[i] = _fsTextures[i] != nil ? [_fsTextures[i] hakiosTexture] : NULL;
+		if (i == 3 && readAs != 0 && _fsTextures[i] != nil) {
+			/* (the image of a stand-in variant that reads it otherwise than its function asked: hm_input_swizzle) */
+			hakios_metal_texture *as = [(HakiosMetalTexture *)_fsTextures[i] hakiosTextureReadAs:readAs];
+			if (as != NULL) fsTex[i] = as;
+		}
 		if (_fsTextures[i] != nil && hm_timeline_on()) {
 			unsigned kind = [_fsTextures[i] hakiosStorageKind];
 			const unsigned origin = hakios_metal_texture_origin([_fsTextures[i] hakiosTexture]);

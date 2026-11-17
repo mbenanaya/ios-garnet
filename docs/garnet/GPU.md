@@ -7,6 +7,7 @@
 | GPU core clock | 295 MHz at every level | 345-940 MHz, `adreno_speed=8` = 940 MHz |
 | Home-screen page swipes | about 36 fps | 62-68 fps |
 | GMEM (tile) rendering | hung (SMMU fault at address 0) | works |
+| Rearrange-mode delete badges, "Done" label | dark green squares, a dark box | round grey badges, plain text |
 
 ## Findings
 
@@ -21,10 +22,18 @@ address 0. `hakios-metal` now emits it in the binning setup on A7xx.
 
 **Missing constant buffers** are bound as zero-filled buffers instead of being skipped.
 
+**Stand-in shader variants.** The iOS 16.5 image has no generic CoreAnimation shaders, only Apple's precompiled
+variants (`default.pipelinelib`). For a pipeline CoreAnimation makes at run time, the plug-in takes the nearest
+variant by label. Some of those read a different channel of their image than the one asked for: `..._Igrn` (alpha in
+green) got `..._Ialp`, `..._Isrg` (grey and alpha in RG8, read r r r g) got `..._Isrc`. Grey-and-alpha images then
+drew as opaque squares. The plug-in now binds such an image through a texture swizzle that turns the stand-in's read
+into the one asked for (`hm_input_swizzle` in `userland/src/HakiosMetalCA.m`).
+
 ## Known issues
 
-- Coloured blocks during fast page swipes, only with GMEM, at the seam between two tile columns (around x = 480-600 of
-  1125). It is a rendering bug, not a display one; the system-memory path is clean.
+- Coloured blocks during fast page swipes, only with GMEM, near the seam between two tile columns (around x = 470-580
+  of 1125): last frame's pixels left in place. The system-memory path is clean; the hardware's binning (visibility)
+  is not the cause.
 - Control Center draws two full-screen passes: 35-40 fps.
 - `adreno_vote=1` (GMU bandwidth vote) makes the GMU fail; do not use it.
 
