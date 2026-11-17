@@ -13,6 +13,7 @@
 | Page swipes, frames over 16.7 ms | 10-11% | 1-6% |
 | Settings list scroll | 62 fps, a third of the frames late | 60 fps, none late |
 | CoreAnimation's full-screen GMEM pass | 10.7 ms | 8.0 ms |
+| Brightness slider | moved, the panel stayed as the boot loader left it | sets the panel's brightness |
 | Opening Control Center | 2-3 frames (the window server stalled 2.5 s) | animates, about 35 fps |
 | Opening an app, finger up to its first frame | about 330 ms | about 120 ms |
 | Shader compiling in a session (the window server, a bench run) | 4.6 s, 4 s of it before the lock screen | 18 ms, with the image's shader cache |
@@ -74,6 +75,13 @@ compiled from Apple's shaders and stay out of the repository; see `tools/garnet-
 120 Hz timing with its front porch stretched); otherwise the display interface may say 2752 lines with a line counter
 that counts each line twice. The tear-free mode takes both. Neither the frame's length nor its porch sets the rate:
 written to 2752 lines, the panel still refreshed 60 times a second, so the DSI link paces it.
+
+**Brightness.** CoreBrightness (in backboardd) drives the display through a kernel service it finds by class,
+AppleARMBacklight, writing `brightness` (0 to 65536, its own fades as many steps) into its properties; with no such
+service the slider moved and nothing happened. The display driver now publishes one and sends each level to the
+panel as DCS `0x51` with an 11-bit level (2047 the most outside high-brightness mode), through the DSI controller's
+command FIFO in the frame's blanking. `fb_bl=0` keeps the service but sends nothing; `fb_bl_min=N` (default 8) is
+the lowest level sent.
 
 **Frames waiting for the panel.** The Metal boot arguments use `fb_queue=2` (the driver's default): with `fb_queue=1`
 the window server waited in its swap for the frame before it to be taken.

@@ -306,6 +306,211 @@ measurePanel(__unused void * arg, __unused wait_result_t wr)
 #define INTF_HSYNC_CTL          0x008
 #define INTF_VSYNC_PERIOD_F0    0x00c
 
+/*
+ * The panel's brightness. CoreBrightness (in backboardd) drives the display's brightness through a kernel service it
+ * finds by class, AppleARMBacklight (or by a "backlight-control" property): it reads the range from the service's
+ * properties and sets the brightness with IORegistryEntrySetCFProperty, which arrives here as setProperties(). Without
+ * the service the brightness slider moved and nothing happened.
+ *
+ * garnet's panel (an AMOLED, DSC video mode) takes its brightness as a DCS command, 0x51 with an 11-bit level
+ * (0x7ff the most outside high brightness mode: mi,mdss-fac-brightness-max-level), sent here through the DSI
+ * controller's command FIFO as Linux's dsi_ctrl_hw_cmn_kickoff_fifo_command() does: the packet's words into the
+ * test pattern generator's DMA FIFO, embedded mode, a software trigger, and the DMA's done bit waited for. No
+ * memory is read by the controller, so nothing has to be mapped for it.
+ *
+ * Boot-arg fb_bl=0: the service, but no command sent (what it was asked for is still logged). fb_bl_min=N: the
+ * lowest level ever sent (default 8: never black). fb_bl_log=N: so many of the requests are logged (default 40).
+ */
+static TUNABLE(uint32_t, gBacklight, "fb_bl", 1);
+static TUNABLE(uint32_t, gBacklightMin, "fb_bl_min", 8);
+static TUNABLE(uint32_t, gBacklightLog, "fb_bl_log", 40);
+static TUNABLE(uint64_t, gBacklightDsi, "fb_bl_dsi", 0x0ae94000);
+#define BL_LEVEL_MAX            0x7ff
+#define DSI_REG_CTRL            0x004
+#define DSI_REG_CMD_DMA_CTRL    0x03c
+#define DSI_REG_DMA_CMD_LENGTH  0x04c
+#define DSI_REG_TRIG_CTRL       0x084
+#define DSI_REG_CMD_DMA_SW_TRIG 0x090
+#define DSI_REG_INT_CTRL        0x110
+#define DSI_REG_TPG_CTRL        0x15c
+#define DSI_REG_TPG_DMA_FIFO    0x17c
+#define DSI_REG_TPG_FIFO_RESET  0x1ec
+
+static IOLock * gBacklightLock;
+static vm_offset_t gBacklightRegs;
+static uint32_t gBacklightLevel = ~0u;          /* the level last sent */
+static uint32_t gBacklightSaid;
+
+static inline uint32_t blRead(uint32_t offset) { return *(volatile uint32_t *)(gBacklightRegs + offset); }
+static inline void blWrite(uint32_t offset, uint32_t value) { *(volatile uint32_t *)(gBacklightRegs + offset) = value; __builtin_arm_dsb(0xf); }
+
+/* DCS 0x51 with LEVEL (0..0x7ff), high byte first, as a long write in high speed: true when the controller said it went out */
+static bool
+panelSendBrightness(uint32_t level)
+{
+	const uint32_t header = 0x00000003u | 0x39u << 16 | (0x40u | 0x80u) << 24;   /* WC 3, DCS long write, payload + last */
+	const uint32_t payload = 0x51u | ((level >> 8) & 0xff) << 8 | (level & 0xff) << 16 | 0xffu << 24;
+	uint32_t ctrl, dma, done = 0;
+
+	if (gBacklightRegs == 0) {
+		char version[128] = "";
+
+		/* (only where the display interface is known, as for fb_beam: elsewhere this is somebody else's registers) */
+		if (gIntfPhysical == 0 && !(PE_parse_boot_argn("hakios_kver", version, sizeof(version)) && strnstr(version, "-sc7280-", sizeof(version)))) {
+			return false;
+		}
+		gBacklightRegs = ml_io_map((vm_offset_t) (gBacklightDsi & ~0x3fffULL), 0x4000) + (vm_offset_t) (gBacklightDsi & 0x3fffULL);
+		IOLog("MiniIOMobileFramebuffer: backlight: DSI at %#llx: ctrl %#x, command DMA %#x, trigger %#x, interrupts %#x\n",
+		    gBacklightDsi, blRead(DSI_REG_CTRL), blRead(DSI_REG_CMD_DMA_CTRL), blRead(DSI_REG_TRIG_CTRL), blRead(DSI_REG_INT_CTRL));
+	}
+	ctrl = blRead(DSI_REG_CTRL);
+	if (!(ctrl & 1)) {
+		return false;                           /* the controller is off */
+	}
+	blWrite(DSI_REG_CTRL, ctrl | (1u << 2));                        /* CMD_MODE_EN, for the command DMA */
+	blWrite(DSI_REG_TPG_CTRL, (1u << 1) | (1u << 2) | (3u << 16));  /* the command DMA from the TPG's FIFO */
+	blWrite(DSI_REG_TPG_DMA_FIFO, header);
+	blWrite(DSI_REG_TPG_DMA_FIFO, payload);
+	dma = blRead(DSI_REG_CMD_DMA_CTRL);
+	dma &= ~((1u << 31) | (1u << 30) | (1u << 26));                 /* no broadcast, not master, high speed */
+	dma |= 1u << 28;                                                /* embedded mode */
+	blWrite(DSI_REG_CMD_DMA_CTRL, dma);
+	blWrite(DSI_REG_DMA_CMD_LENGTH, 8);
+	blWrite(DSI_REG_CMD_DMA_SW_TRIG, 1);
+	for (int i = 0; i < 400 && !done; i++) {                        /* (a frame at most: it goes out in the blanking) */
+		done = blRead(DSI_REG_INT_CTRL) & 1;
+		if (!done) {
+			IODelay(50);
+		}
+	}
+	if (done) {
+		blWrite(DSI_REG_INT_CTRL, (blRead(DSI_REG_INT_CTRL) & ~((1u << 24) | (1u << 28))) | 1u);   /* the done bit cleared, errors left */
+	}
+	blWrite(DSI_REG_TPG_CTRL, 0);
+	blWrite(DSI_REG_TPG_FIFO_RESET, 1);
+	IODelay(1);
+	blWrite(DSI_REG_TPG_FIFO_RESET, 0);
+	blWrite(DSI_REG_CTRL, ctrl);
+	return done != 0;
+}
+
+/* a number out of whatever CoreBrightness set: a dictionary's "value" (with its "min" and "max"), or a number */
+static bool
+blNumber(OSObject * o, double * value)
+{
+	OSNumber * n = OSDynamicCast(OSNumber, o);
+
+	if (n == NULL) {
+		return false;
+	}
+	*value = (double) n->unsigned64BitValue();   /* (the kernel's numbers are integers) */
+	return true;
+}
+
+class AppleARMBacklight : public IOService
+{
+	OSDeclareDefaultStructors(AppleARMBacklight);
+
+public:
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+	void apply(double fraction, const char * from);
+};
+
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+
+void
+AppleARMBacklight::apply(double fraction, const char * from)
+{
+	uint32_t level, min = gBacklightMin < BL_LEVEL_MAX ? gBacklightMin : 8;
+	bool sent = false;
+
+	if (!(fraction >= 0)) {
+		return;
+	}
+	fraction = fraction > 1 ? 1 : fraction;
+	level = (uint32_t) (fraction * BL_LEVEL_MAX + 0.5);
+	level = level < min ? min : level;
+	IOLockLock(gBacklightLock);
+	if (level != gBacklightLevel && gBacklight) {
+		sent = panelSendBrightness(level);
+		if (sent) {
+			gBacklightLevel = level;
+		}
+	}
+	IOLockUnlock(gBacklightLock);
+	if (gBacklightSaid < gBacklightLog) {
+		gBacklightSaid++;
+		IOLog("MiniIOMobileFramebuffer: backlight: %s %u/2047 from %s (%u %%)%s\n", sent ? "sent" : "not sent", level, from,
+		    (uint32_t) (fraction * 100 + 0.5), gBacklight ? "" : " (fb_bl=0)");
+	}
+}
+
+IOReturn
+AppleARMBacklight::setProperties(OSObject * properties)
+{
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
+	OSSerialize * text;
+	double value, min = 0, max = 0;
+
+	if (dict == NULL) {
+		return kIOReturnBadArgument;
+	}
+	if (gBacklightSaid < gBacklightLog && (text = OSSerialize::withCapacity(512)) != NULL) {
+		if (dict->serialize(text)) {
+			IOLog("MiniIOMobileFramebuffer: backlight: asked: %.400s\n", text->text());
+		}
+		text->release();
+	}
+	/* IODisplayParameters = { brightness = { min, max, value } } (or the inner dictionary itself) */
+	OSDictionary * parameters = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
+	OSDictionary * brightness = OSDynamicCast(OSDictionary, (parameters ? parameters : dict)->getObject("brightness"));
+	if (brightness != NULL && blNumber(brightness->getObject("value"), &value)) {
+		blNumber(brightness->getObject("min"), &min);
+		if (!blNumber(brightness->getObject("max"), &max) || max <= min) {
+			max = 65536;
+		}
+		apply((value - min) / (max - min), "IODisplayParameters");
+		return kIOReturnSuccess;
+	}
+	if (blNumber(dict->getObject("brightness"), &value)) {
+		apply(value <= 1 ? value : value / 65536, "brightness");
+		return kIOReturnSuccess;
+	}
+	return kIOReturnSuccess;        /* (unknown keys: taken and said, nothing done) */
+}
+
+/* the service, under the framebuffer: matched by CoreBrightness before backboardd draws */
+static void
+backlightPublish(IOService * provider)
+{
+	AppleARMBacklight * bl = new AppleARMBacklight;
+	OSDictionary * parameters = OSDictionary::withCapacity(1);
+	OSDictionary * brightness = OSDictionary::withCapacity(3);
+	OSNumber * n;
+
+	if (bl == NULL || parameters == NULL || brightness == NULL || !bl->init()) {
+		OSSafeReleaseNULL(parameters);
+		OSSafeReleaseNULL(brightness);
+		OSSafeReleaseNULL(bl);
+		return;
+	}
+	gBacklightLock = IOLockAlloc();
+	n = OSNumber::withNumber(0ULL, 32); brightness->setObject("min", n); n->release();
+	n = OSNumber::withNumber(65536ULL, 32); brightness->setObject("max", n); n->release();
+	n = OSNumber::withNumber(32768ULL, 32); brightness->setObject("value", n); n->release();
+	parameters->setObject("brightness", brightness);
+	bl->setProperty("IODisplayParameters", parameters);
+	bl->setProperty("backlight-control", kOSBooleanTrue);
+	bl->setProperty("built-in", kOSBooleanTrue);
+	parameters->release();
+	brightness->release();
+	if (bl->attach(provider) && bl->start(provider)) {
+		bl->registerService();
+		IOLog("MiniIOMobileFramebuffer: backlight: AppleARMBacklight published (fb_bl=%u)\n", gBacklight);
+	}
+	bl->release();
+}
+
 static inline uint32_t
 refreshHz(void)
 {
@@ -642,6 +847,7 @@ IOMobileFramebuffer::start(IOService * provider)
 	if (gMeasure && kernel_thread_start(measurePanel, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
+	backlightPublish(this);
 	fLock = IOLockAlloc();
 	fSwapLock = IOLockAlloc();
 	if (panel_thread_start(&IOMobileFramebuffer::presenterMain, this, &thread) != KERN_SUCCESS) {
