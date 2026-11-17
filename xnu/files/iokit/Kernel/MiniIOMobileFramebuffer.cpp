@@ -1323,6 +1323,14 @@ IOMobileFramebuffer::beamProbe(void)
 	if (frames == 0 || lines / scale < fPanelHeight || lines / scale > fPanelHeight * 4 || smallest > fPanelHeight / 4) {
 		snprintf(said, sizeof(said), "the interface's counters do not count as they should (%u frames, lines %u to %u, "
 		    "a frame of %u lines): frames stay on their beat", frames, smallest, lines, frameLines);
+	} else if ((scale != 1 || lines > fPanelHeight * 2) && gBeam != 2) {
+		/*
+		 * garnet's two layouts (two counts a line, or the stretched frame): written behind the scan so, the picture
+		 * flickered whenever it changed (17 November, seen on the phone; fb_beam=0 did not). Where the scan really is
+		 * in such a frame is not known well enough: frames stay on their beat unless fb_beam=2 asks for it.
+		 */
+		snprintf(said, sizeof(said), "a scan of %u counts (%u a line, a frame of %u lines): frames stay on their beat "
+		    "(fb_beam=2 writes them behind it)", lines + 1, scale, frameLines);
 	} else {
 		fBeamLines = lines + 1;
 		fBeamScale = scale;

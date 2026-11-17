@@ -9,8 +9,6 @@
 | GMEM (tile) rendering | hung (SMMU fault at address 0) | works |
 | Rearrange-mode delete badges, "Done" label | dark green squares, a dark box | round grey badges, plain text |
 | Fast page swipes with GMEM | coloured blocks beside moving icons | clean |
-| Frames on the panel | copied across the line being scanned (torn) | written behind the scan |
-| Page swipes, frames over 16.7 ms | 10-11% | 1-6% |
 | Settings list scroll | 62 fps, a third of the frames late | 60 fps, none late |
 | CoreAnimation's full-screen GMEM pass | 10.7 ms | 8.0 ms |
 | Brightness slider | moved, the panel stayed as the boot loader left it | sets the panel's brightness |
@@ -53,8 +51,8 @@ once before the tiles (`encodeInPass`'s `hoisted` stream); `metal_gmem_off=8192`
 second, and the display interface's line counter counts each line twice (up to 5504). The display driver's tear-free
 mode (`fb_beam`: frames written behind the line being scanned) refused that counter and stayed off, so every frame was
 copied into the panel's memory across the scan. It now reads the frame's length from the interface's registers
-(`INTF_VSYNC_PERIOD_F0` over the line length in `INTF_HSYNC_CTL`), accepts a counter of two counts a line, and starts
-3 s after boot instead of a minute.
+(`INTF_VSYNC_PERIOD_F0` over the line length in `INTF_HSYNC_CTL`) and can place the rows by such a counter, starting
+3 s after boot instead of a minute; on garnet it does so only with `fb_beam=2` (see below).
 
 **Pipelines waiting for specialisations.** All shader compilations share one compiler and one lock. The plug-in
 specialises CoreAnimation's uber shaders on a background queue (200-440 ms each, the uber shader drawing meanwhile),
@@ -73,7 +71,8 @@ compiled from Apple's shaders and stay out of the repository; see `tools/garnet-
 
 **Two ways the boot loader leaves the panel.** Started from Android, the boot loader leaves a frame of 5504 lines (the
 120 Hz timing with its front porch stretched); otherwise the display interface may say 2752 lines with a line counter
-that counts each line twice. The tear-free mode takes both. Neither the frame's length nor its porch sets the rate:
+that counts each line twice. Written behind the scan in either, the picture flickered whenever it changed, so the
+tear-free mode stays off on these layouts unless `fb_beam=2` asks for it (frames go out on the driver's beat, as before). Neither the frame's length nor its porch sets the rate:
 written to 2752 lines, the panel still refreshed 60 times a second, so the DSI link paces it.
 
 **Brightness.** CoreBrightness (in backboardd) drives the display through a kernel service it finds by class,
