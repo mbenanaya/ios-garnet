@@ -331,6 +331,62 @@ struct rec_frame {
 
 extern "C" uint64_t loader_recording[3];        /* { physical address, bytes, kernel address }: osfmk/arm64/loader_return.c */
 
+/*
+ * sysctl kern.hakios.stage (write only, root): bytes for the host, handed to the loader as the run's recording. Once
+ * the kernel is back, "fastboot oem recording" stages them and "fastboot get_staged FILE" sends them to the computer.
+ * A way out for what a run made in RAM, with nothing written to the phone's storage: userland/src/stage_put.c packs
+ * the window server's compiled shader stages into it (tools/metal-cache-pull.sh unpacks them into the image's seed).
+ * Each write replaces the one before. Refused while the screen is being recorded (rec_secs): that has the slot.
+ */
+#define STAGE_MAX_BYTES (256ULL << 20)
+static IOBufferMemoryDescriptor * gStaged;
+
+static int
+stageSysctl SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	IOBufferMemoryDescriptor * memory, * old;
+	size_t length = req->newlen;
+	int error;
+
+	if (req->newptr == USER_ADDR_NULL) {
+		return req->oldptr == USER_ADDR_NULL ? SYSCTL_OUT(req, &loader_recording[1], sizeof(loader_recording[1])) : EPERM;
+	}
+	if (gRecSeconds != 0) {
+		return EBUSY;
+	}
+	if (length <= 24 || length > STAGE_MAX_BYTES) {
+		return EINVAL;
+	}
+	memory = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+	    (mach_vm_size_t) length, ~0ULL);
+	if (memory == NULL) {
+		return ENOMEM;
+	}
+	error = SYSCTL_IN(req, memory->getBytesNoCopy(), length);
+	if (error != 0) {
+		memory->release();
+		return error;
+	}
+	/* (the length last: a loader that read the slot half way would see nothing, not the wrong bytes) */
+	loader_recording[1] = 0;
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	loader_recording[0] = memory->getPhysicalSegment(0, NULL);
+	loader_recording[2] = (uint64_t) (uintptr_t) memory->getBytesNoCopy();
+	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+	loader_recording[1] = length;
+	old = gStaged;
+	gStaged = memory;
+	if (old != NULL) {
+		old->release();
+	}
+	IOLog("MiniIOMobileFramebuffer: kern.hakios.stage: %zu bytes at %#llx for the host (\"fastboot oem recording\" once the run is over)\n",
+	    length, loader_recording[0]);
+	return 0;
+}
+SYSCTL_PROC(_kern_hakios, OID_AUTO, stage, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, stageSysctl, "-",
+    "bytes for the host: the loader stages them as the run's recording");
+
 static uint32_t
 swapWord(const uint8_t * swap, unsigned offset)
 {
@@ -1003,18 +1059,20 @@ IOMobileFramebuffer::beamProbe(void)
 	 * The interface's own frame, from its registers (INTF_VSYNC_PERIOD_F0 over the line's length in INTF_HSYNC_CTL). garnet's
 	 * line counter goes to 5504 in a frame of 2752 lines (the panel's 120 Hz timing, which its boot loader runs at 60 a
 	 * second): two counts a line. A counter whose top is a whole number of times the frame's lines counts in those parts
-	 * of a line; the rows are placed by it (fBeamScale).
+	 * of a line; the rows are placed by it (fBeamScale). Started from Android, its boot loader leaves the same rate as
+	 * a frame of 5504 lines instead, the front porch stretched (one count a line): frames to four times the panel's
+	 * height are taken, the blanking counted before the first row as ever (later than it is: a margin).
 	 */
 	hsync = *(volatile uint32_t *)(intf + INTF_HSYNC_CTL) >> 16;
 	frameLines = hsync != 0 ? *(volatile uint32_t *)(intf + INTF_VSYNC_PERIOD_F0) / hsync : 0;
-	if (frameLines >= fPanelHeight && frameLines <= fPanelHeight * 2) {
+	if (frameLines >= fPanelHeight && frameLines <= fPanelHeight * 4) {
 		uint32_t s = (lines + frameLines / 2) / frameLines;
 
 		if (s >= 1 && s <= 4 && lines + 2 * s >= s * frameLines && lines <= s * frameLines + 2 * s) {
 			scale = s;
 		}
 	}
-	if (frames == 0 || lines / scale < fPanelHeight || lines / scale > fPanelHeight * 2 || smallest > fPanelHeight / 4) {
+	if (frames == 0 || lines / scale < fPanelHeight || lines / scale > fPanelHeight * 4 || smallest > fPanelHeight / 4) {
 		snprintf(said, sizeof(said), "the interface's counters do not count as they should (%u frames, lines %u to %u, "
 		    "a frame of %u lines): frames stay on their beat", frames, smallest, lines, frameLines);
 	} else {

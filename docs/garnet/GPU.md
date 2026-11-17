@@ -15,6 +15,7 @@
 | CoreAnimation's full-screen GMEM pass | 10.7 ms | 8.0 ms |
 | Opening Control Center | 2-3 frames (the window server stalled 2.5 s) | animates, about 35 fps |
 | Opening an app, finger up to its first frame | about 330 ms | about 120 ms |
+| Shader compiling in a session (the window server, a bench run) | 4.6 s, 4 s of it before the lock screen | 18 ms, with the image's shader cache |
 
 ## Findings
 
@@ -62,6 +63,18 @@ waiting foreground compilation before any background one (`hakios_metal_compile_
 starts only after 400 ms without a new pipeline. The `linked ...` log line says how long each pipeline took and how
 much of it was waiting.
 
+**Shader cache in the image.** Every boot runs from RAM, so the window server compiled CoreAnimation's shaders anew
+each time. A run of `devices/garnet/rc.jobs.cache` collects the compiled stages; its last job (`stage_put`) hands them
+to the kernel (`kern.hakios.stage`), which leaves them for the loader as it leaves a screen recording, and
+`fastboot oem recording` / `fastboot get_staged` bring them to the computer. Nothing is written to the phone's storage.
+`tools/garnet-wifi-image.sh` puts them into the next image (`/redwood/share/hakios-metal-cache`). The stages are
+compiled from Apple's shaders and stay out of the repository; see `tools/garnet-metal-cache.sh`.
+
+**Two ways the boot loader leaves the panel.** Started from Android, the boot loader leaves a frame of 5504 lines (the
+120 Hz timing with its front porch stretched); otherwise the display interface may say 2752 lines with a line counter
+that counts each line twice. The tear-free mode takes both. Neither the frame's length nor its porch sets the rate:
+written to 2752 lines, the panel still refreshed 60 times a second, so the DSI link paces it.
+
 **Frames waiting for the panel.** The Metal boot arguments use `fb_queue=2` (the driver's default): with `fb_queue=1`
 the window server waited in its swap for the frame before it to be taken.
 
@@ -71,10 +84,10 @@ the window server waited in its swap for the frame before it to be taken.
 - Opening and closing apps: 30-40 fps. Their frames draw some 15 full-screen layers (wallpaper, the app's snapshot,
   backdrops), close to what the GPU can fill at 1125x2436.
 - SpringBoard spends about 100 ms on its main thread after a tap before the launch animation's first frame.
-- The first boot of a session compiles CoreAnimation's shaders anew (about 4 s before the lock screen's first frames):
-  the compiled stages are kept only with `var_store=1`.
+- Without a shader cache in the image (`tools/garnet-metal-cache.sh`), each boot compiles CoreAnimation's shaders
+  anew: about 4 s before the lock screen's first frames, and short stalls as screens first appear.
 - The panel refreshes at 60 Hz. The boot loader runs its 120 Hz timing on a half-rate pixel clock (no adaptive
-  refresh and no front porch to shorten), so 120 Hz needs the DSI clock reprogrammed.
+  refresh, and the frame's length does not set the rate), so 120 Hz needs the DSI clock reprogrammed.
 - `adreno_vote=1` (GMU bandwidth vote) makes the GMU fail; do not use it.
 
 ## Arguments

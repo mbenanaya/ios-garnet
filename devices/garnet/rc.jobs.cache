@@ -1,0 +1,23 @@
+# Commands run by the launchd job com.redwood.demo (see com.redwood.demo.plist).
+/redwood/bin/hello_dyn started by launchd
+# --- the shader cache run (tools/garnet-metal-cache.sh): as much of the UI as can be reached without a finger, then the compiled stages
+# --- the window server and the rest made in RAM handed to the host (stage_put; nothing is written to storage) ---
+/redwood/bin/rwtouch wait 32 swipe 0.5 0.985 0.5 0.3 200 wait 8
+# the home screen's pages, the App Library past the last one, back
+/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 200 wait 1 swipe 0.85 0.5 0.15 0.5 200 wait 2 swipe 0.15 0.5 0.85 0.5 200 wait 1 swipe 0.15 0.5 0.85 0.5 200 wait 2
+# apps from page 1: opened, scrolled, closed by the home gesture
+/redwood/bin/rwtouch tap 0.613 0.714 wait 4 swipe 0.5 0.8 0.5 0.3 200 wait 2 swipe 0.5 0.985 0.5 0.3 200 wait 3
+/redwood/bin/rwtouch tap 0.613 0.36 wait 4 swipe 0.5 0.8 0.5 0.3 200 wait 2 swipe 0.5 0.985 0.5 0.3 200 wait 3
+/redwood/bin/rwtouch tap 0.152 0.477 wait 4 swipe 0.5 0.8 0.5 0.3 200 wait 2 swipe 0.5 0.985 0.5 0.3 200 wait 3
+/redwood/bin/rwtouch tap 0.384 0.36 wait 4 swipe 0.5 0.8 0.5 0.3 200 wait 2 swipe 0.5 0.985 0.5 0.3 200 wait 3
+/redwood/bin/rwtouch tap 0.613 0.477 wait 4 swipe 0.85 0.5 0.15 0.5 200 wait 2 swipe 0.5 0.985 0.5 0.3 200 wait 3
+/redwood/bin/rwtouch tap 0.384 0.477 wait 4 swipe 0.5 0.8 0.5 0.3 200 wait 2 swipe 0.5 0.985 0.5 0.3 200 wait 3
+# Control Center, Notification Center, Spotlight, the app switcher
+/redwood/bin/rwtouch swipe 0.9 0.005 0.9 0.5 300 wait 3 swipe 0.5 0.9 0.5 0.3 250 wait 2
+/redwood/bin/rwtouch swipe 0.3 0.005 0.3 0.6 300 wait 3 swipe 0.5 0.95 0.5 0.3 250 wait 2
+/redwood/bin/rwtouch swipe 0.5 0.4 0.5 0.7 300 wait 3 swipe 0.5 0.95 0.5 0.3 250 wait 2 tap 0.5 0.05 wait 2
+/redwood/bin/rwtouch drag 0.5 0.995 0.5 0.6 400 600 wait 3 tap 0.5 0.05 wait 2
+# once more each, as the compiles queued meanwhile finish (the specialisations wait for a pause in pipeline making)
+/redwood/bin/rwtouch tap 0.613 0.714 wait 3 swipe 0.5 0.985 0.5 0.3 200 wait 2 swipe 0.9 0.005 0.9 0.5 300 wait 2 swipe 0.5 0.9 0.5 0.3 250 wait 30
+/redwood/bin/stage_put /var/tmp/hakios-metal-cache /private/var/db/hakios-metal-cache
+/bin/ls -l /var/tmp/hakios-metal-cache

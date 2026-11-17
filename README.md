@@ -92,6 +92,9 @@ DARWIN_ROOTFS=/path/to/unpacked/ios16.5/rootfs \
   bash tools/garnet-wifi-image.sh fw-wifi userland/root.apfs
 ```
 
+Optional, once: a shader cache, so that no boot compiles CoreAnimation's shaders again (one run collects them and
+hands them over through RAM; nothing is written to the phone's storage). See `tools/garnet-metal-cache.sh`.
+
 ### 4. Boot
 
 Put the phone in fastboot (Power + Volume Down), then:

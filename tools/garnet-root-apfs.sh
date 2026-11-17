@@ -2,7 +2,7 @@
 # Rebuild garnet's root.apfs (md1, mounted at /redwood) from the device repo's image with this build's files in it.
 #
 # usage: tools/garnet-root-apfs.sh BASE.apfs OUT.apfs [--plugin BINARY] [--plugin-plist PLIST] [--osmesa DYLIB]
-#                                  [--file SRC=PATH]... [--manifest FILE]
+#                                  [--file SRC=PATH]... [--metal-cache DIR] [--manifest FILE]
 #
 #   --plugin        hakios-metal's Metal plug-in (userland/src/HakiosMetalCA.m + HakiosMetalAlias.m), installed as
 #                   lib/RedwoodMetal.bundle/RedwoodMetal: the bundle the system image links from
@@ -25,7 +25,7 @@ MKAPFS="python3 $here/apfs/mkapfs.py"
 [ $# -ge 2 ] || { sed -n 2,16p "$0" >&2; exit 2; }
 base=$1 out=$2
 shift 2
-plugin= plist= osmesa= manifest=
+plugin= plist= osmesa= manifest= metalcache=
 files=()
 while [ $# -gt 0 ]; do
 	case $1 in
@@ -34,6 +34,7 @@ while [ $# -gt 0 ]; do
 	--osmesa) osmesa=$2; shift 2 ;;
 	--manifest) manifest=$2; shift 2 ;;
 	--file) files+=("$2"); shift 2 ;;
+	--metal-cache) metalcache=$2; shift 2 ;;
 	*) echo "garnet-root-apfs.sh: unknown option $1" >&2; exit 2 ;;
 	esac
 done
@@ -66,8 +67,13 @@ if [ -n "$plugin" ]; then
 		mkdir -p "$tree/share/ca-share"
 		ln -s ../QuartzCore-default.metallib "$tree/share/ca-share/QuartzCore-default.metallib"
 	fi
-	# ... and the compiled-stage cache's seed directory (HM_CACHE_SEED): empty, the device fills /var/db's
+	# ... and the compiled-stage cache's seed directory (HM_CACHE_SEED): the stages of --metal-cache DIR (a run's,
+	# tools/metal-cache-pull.sh), else empty
 	mkdir -p "$tree/share/hakios-metal-cache"
+	if [ -n "$metalcache" ] && ls "$metalcache"/*.stage >/dev/null 2>&1; then
+		cp "$metalcache"/*.stage "$tree/share/hakios-metal-cache/"
+		echo "garnet-root-apfs.sh: $(ls "$metalcache"/*.stage | wc -l) compiled stages into /redwood/share/hakios-metal-cache"
+	fi
 fi
 if [ -n "$osmesa" ]; then
 	rm -f "$tree/lib/libOSMesa.8.dylib"

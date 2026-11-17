@@ -38,6 +38,10 @@ if [ -n "$NETJOBS" ]; then
 fi
 for f in out/wifi-jobs/*.plist; do [ -f "$f" ] && args+=(--file "$f=/LaunchDaemons/$(basename "$f")"); done
 [ -n "$JOBS" ] && args+=(--file "$JOBS=/etc/rc.jobs")
+# the window server's compiled shader stages from an earlier run (tools/garnet-metal-cache.sh), and the tool that
+# hands a run's to the host, when they have been made
+ls userland/hakios-metal-cache/*.stage >/dev/null 2>&1 && args+=(--metal-cache userland/hakios-metal-cache)
+[ -f out/stage_put ] && args+=(--file out/stage_put=/bin/stage_put)
 bash tools/garnet-root-apfs.sh devices/garnet/userland/root.apfs "$OUT" --plugin out/metal/RedwoodMetal \
 	--plugin-plist userland/src/RedwoodMetal-garnet.plist --osmesa xnu-deps/build/mesa/out/libOSMesa.8.dylib \
 	--file out/metal/sleepd_stub=/bin/sleepd_stub --file userland/src/com.redwood.svcstub.plist=/LaunchDaemons/com.redwood.svcstub.plist \
