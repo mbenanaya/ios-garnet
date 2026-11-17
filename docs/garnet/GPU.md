@@ -83,8 +83,10 @@ command FIFO, scheduled for the first line of the vertical blanking (sent at onc
 picture flickered and tore while the slider moved), by a thread that sends only the newest level. `fb_bl=0` keeps the service but sends nothing; `fb_bl_min=N` (default 8) is
 the lowest level sent.
 
-**Frames waiting for the panel.** The Metal boot arguments use `fb_queue=2` (the driver's default): with `fb_queue=1`
-the window server waited in its swap for the frame before it to be taken.
+**Frames waiting for the panel.** The Metal boot arguments keep `fb_queue=1`. With `fb_queue=2` (the driver's own
+default) a swap is taken while the frame before it still waits for the panel, and under load (Wi-Fi traffic while an
+app opened) CoreAnimation drew its next frame into a surface that was still to be shown: half-drawn frames, black
+with streaks of the picture, flashed on the screen.
 
 ## Known issues
 

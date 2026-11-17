@@ -31,7 +31,7 @@ DIV='------------------------------------------------------------'
 
 # The default: the window server through Metal with GMEM tiles, the GPU at 940 MHz, and Wi-Fi (wifi=1; it needs
 # the firmware in the root image, see the README). Known: coloured blocks at a tile seam during fast swipes.
-DEFAULT_ARGS="garnet_touch=1 garnet_buttons=1 garnet_cpufreq=1 bootcpu=7 cpus=8 gpu=1 gl=1 adreno_speed=8 ddr=2 fb_queue=2 ui_lite=1 caenv=CA_DISABLE_DIRTY_REGIONS=1 gpu_recover=1 wallpaper_freeze=1 fb_hz=120 anim_max=1 fb_threads=6 fb_intf=0x0ae36000 metal=1 metal_all=1 ca_metallib=/redwood/share/QuartzCore-default.metallib metal_gmem=1 metal_gmem_draws=24 wifi=1"
+DEFAULT_ARGS="garnet_touch=1 garnet_buttons=1 garnet_cpufreq=1 bootcpu=7 cpus=8 gpu=1 gl=1 adreno_speed=8 ddr=2 fb_queue=1 ui_lite=1 caenv=CA_DISABLE_DIRTY_REGIONS=1 gpu_recover=1 wallpaper_freeze=1 fb_hz=120 anim_max=1 fb_threads=6 fb_intf=0x0ae36000 metal=1 metal_all=1 ca_metallib=/redwood/share/QuartzCore-default.metallib metal_gmem=1 metal_gmem_draws=24 wifi=1"
 # The old default: OpenGL ES through Mesa, no Metal, no Wi-Fi (option o).
 OPENGL_ARGS="garnet_touch=1 garnet_buttons=1 garnet_cpufreq=1 bootcpu=7 cpus=8 gpu=1 gl=1 adreno_speed=6 fb_filter=1 cpuload=500 ddr=2 fb_queue=1 touch_lat=1 ui_lite=1 caenv=CA_DISABLE_DIRTY_REGIONS=1 gpu_recover=1"
 # Metal: the window server on hakios-metal's plug-in (/redwood/lib/RedwoodMetal.bundle, built by CI into root.apfs)
@@ -43,7 +43,7 @@ METAL_ARGS="$OPENGL_ARGS metal=1 metal_all=1 ca_metallib=/redwood/share/QuartzCo
 # for 80..120. fb_filter=1 left out: measured upstream as no help. metal_defer=1 left out of the default sets: before the
 # plug-in's fix it let the panel show frames the GPU had not drawn yet (black strips, a missing first Apple logo); it
 # is only in METAL_DEFER, to compare. The boot line holds 607 characters: these replace, they are not added to.
-METAL_PERF="garnet_touch=1 garnet_buttons=1 garnet_cpufreq=1 bootcpu=7 cpus=8 gpu=1 gl=1 adreno_speed=6 ddr=2 fb_queue=2 ui_lite=1 caenv=CA_DISABLE_DIRTY_REGIONS=1 gpu_recover=1 metal=1 metal_all=1 ca_metallib=/redwood/share/QuartzCore-default.metallib wallpaper_freeze=1 fb_threads=6 fb_hz=120 anim_max=1"
+METAL_PERF="garnet_touch=1 garnet_buttons=1 garnet_cpufreq=1 bootcpu=7 cpus=8 gpu=1 gl=1 adreno_speed=6 ddr=2 fb_queue=1 ui_lite=1 caenv=CA_DISABLE_DIRTY_REGIONS=1 gpu_recover=1 metal=1 metal_all=1 ca_metallib=/redwood/share/QuartzCore-default.metallib wallpaper_freeze=1 fb_threads=6 fb_hz=120 anim_max=1"
 # what gets logged is the same with or without -v: -v only decides whether the panel shows the log or the Apple logo.
 # Every Metal option takes these: frame lines, CPU load, each GPU submission's time, touch latency, the plug-in's
 # counters every 5 s (cpuload=500 and touch_lat=1 were in DEFAULT_ARGS already, so options 2 and 3 log alike too).
