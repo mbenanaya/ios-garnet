@@ -1,0 +1,392 @@
+name: Build ios-garnet (kernel, Wi-Fi driver, loader)
+
+on:
+  push:
+    branches: [ main, dev ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, dev ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Garnet XNU Kernel & Loader
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore executable bits (lost when files are copied in on Windows)
+        run: git ls-files -z -- '*.sh' '*.py' xl 'xnu-deps/host/bin/*' | xargs -0 chmod +x
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify Architecture & Configuration Integrity
+        run: |
+          echo "=== 1. Checking driver declarations and subsystems ==="
+          python3 tools/drivers-check.py
+
+          echo "=== 2. Checking boot arguments and documentation sync ==="
+          python3 tools/boot-args.py --check
+
+          echo "=== 3. Fetching the garnet binaries (UEFI, device tree, root image) ==="
+          bash tools/garnet-prebuilt.sh
+
+          echo "=== 4. Checking Garnet device repository integrity ==="
+          python3 tools/hakios-device.py check garnet
+
+          echo "=== 5. Applying Garnet defconfig ==="
+          python3 tools/hakios-config.py defconfig garnet
+
+          echo "=== 6. Validating .config symbols against drivers ==="
+          python3 tools/hakios-config.py check
+
+      - name: Install System Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            git \
+            curl \
+            clang \
+            lld \
+            llvm \
+            python3-pip \
+            python3-venv \
+            meson \
+            ninja-build \
+            perl \
+            xz-utils \
+            flex \
+            bison \
+            m4 \
+            autoconf \
+            automake \
+            libtool \
+            liblz4-dev \
+            libssl-dev \
+            uuid-dev \
+            libtinfo6 \
+            zip
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
+
+      - name: Install Theos Toolchain & iOS SDK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$HOME/theos/toolchain"
+          echo "Fetching iOS LLVM cross toolchain..."
+          downloaded=false
+          for attempt in 1 2 3 4 5; do
+            echo "Attempt $attempt to fetch toolchain..."
+            if gh release download test-210562a -R L1ghtmann/llvm-project -p "iOSToolchain-x86_64.tar.xz" --dir /tmp && [ -f /tmp/iOSToolchain-x86_64.tar.xz ]; then
+              if tar -xJf /tmp/iOSToolchain-x86_64.tar.xz -C "$HOME/theos/toolchain"; then
+                rm -f /tmp/iOSToolchain-x86_64.tar.xz
+                downloaded=true
+                break
+              fi
+            elif curl -sSL --retry 3 --retry-connrefused https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz -o /tmp/toolchain.tar.xz && [ -f /tmp/toolchain.tar.xz ]; then
+              if tar -xJf /tmp/toolchain.tar.xz -C "$HOME/theos/toolchain"; then
+                rm -f /tmp/toolchain.tar.xz
+                downloaded=true
+                break
+              fi
+            fi
+            rm -f /tmp/toolchain.tar.xz /tmp/iOSToolchain-x86_64.tar.xz
+            echo "Retrying in 5s..."
+            sleep 5
+          done
+          if [ "$downloaded" != "true" ]; then
+            echo "Failed to download toolchain after 5 attempts"
+            exit 1
+          fi
+          echo "Fetching Theos iOS SDKs..."
+          for attempt in 1 2 3; do
+            if git clone --depth 1 https://github.com/theos/sdks.git "$HOME/theos/sdks"; then
+              break
+            fi
+            echo "Retrying git clone in 5 seconds..."
+            sleep 5
+          done
+          test -x "$HOME/theos/toolchain/linux/iphone/bin/ld"
+          test -d "$HOME/theos/sdks/iPhoneOS16.5.sdk/usr/include"
+
+      - name: Compile Freestanding UEFI Loader
+        run: |
+          cd xnuloader
+          bash build.sh
+          cd ..
+          test -f xnuloader/loader.efi
+          ls -lh xnuloader/loader.efi
+
+      - name: Prepare XNU Source & Cross-Compilation Dependencies
+        run: |
+          bash xnu/apply.sh
+          bash xnu-deps/setup.sh
+
+      - name: Build the Wi-Fi driver (Linux ath10k for the WCN3990)
+        run: |
+          bash tools/mk-ath10k.sh
+          ls -l xnu-deps/build/ath10k/out/ath10k.o
+
+      - name: Compile XNU Kernel (DEVELOPMENT_ARM64_BCM2837)
+        run: |
+          mkdir -p out
+          touch out/.kernel-start
+          ./xnu-build.sh -j$(nproc) -k > out/kernel-build.log 2>&1 || true
+          K="xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
+          if [ -f "$K" ] && [ "$K" -nt out/.kernel-start ]; then
+            echo "Kernel compilation succeeded!"
+            ls -lh "$K"
+          else
+            echo "::error::Kernel binary was not created!"
+            grep -C 5 -E "error:|fatal error:" out/kernel-build.log || true
+            tail -n 100 out/kernel-build.log
+            exit 1
+          fi
+
+      - name: Build Mesa 25.0.7 for iOS (Adreno 710, AIR front end)
+        run: |
+          source xnu-env.sh
+          # the tools tools/mk-mesa.sh calls by name
+          for tool in llvm-ar llvm-ranlib llvm-strip llvm-nm; do
+            if ! command -v $tool >/dev/null 2>&1; then
+              src=$(ls /usr/bin/${tool}-* 2>/dev/null | sort -V | tail -n1)
+              [ -n "$src" ] && sudo ln -sf "$src" /usr/local/bin/$tool
+            fi
+          done
+          if ! command -v install_name_tool >/dev/null 2>&1; then
+            if [ -x "$THEOS/toolchain/linux/iphone/bin/install_name_tool" ]; then
+              sudo ln -sf "$THEOS/toolchain/linux/iphone/bin/install_name_tool" /usr/local/bin/install_name_tool
+            else
+              src=$(ls /usr/bin/llvm-install-name-tool* 2>/dev/null | sort -V | tail -n1)
+              [ -n "$src" ] && sudo ln -sf "$src" /usr/local/bin/install_name_tool
+            fi
+          fi
+          [ -e "$XNUDEPS/host/bin/xnu-clang++" ] || ln -sf xnu-clang "$XNUDEPS/host/bin/xnu-clang++"
+          mkdir -p xnu-deps/build/mesa
+          MESA_TAR=xnu-deps/build/mesa/mesa-25.0.7.tar.xz
+          [ -f "$MESA_TAR" ] || curl -fSL --retry 3 -o "$MESA_TAR" https://archive.mesa3d.org/mesa-25.0.7.tar.xz
+          echo "592272df3cf01e85e7db300c449df5061092574d099da275d19e97ef0510f8a6  $MESA_TAR" | sha256sum -c
+          if ! DRIVERS=softpipe,freedreno AIR=1 bash tools/mk-mesa.sh; then
+            echo "::error::tools/mk-mesa.sh failed"
+            for f in xnu-deps/build/mesa/meson-setup.log xnu-deps/build/mesa/ninja.log \
+                     xnu-deps/build/mesa/build-softpipe-freedreno/meson-logs/meson-log.txt; do
+              [ -f "$f" ] && { echo "=== $f"; tail -n 120 "$f"; }
+            done
+            exit 1
+          fi
+          B=xnu-deps/build/mesa/build-softpipe-freedreno
+          # hakios-metal links the AIR front end and ir3 from this build (tools/compiler.mk)
+          [ -f $B/src/compiler/air/libair.a ] || ninja -C $B src/compiler/air/libair.a
+          ls -l xnu-deps/build/mesa/out/ $B/src/compiler/air/libair.a
+
+      - name: Build hakios-metal (A7xx) and the Metal plug-in
+        run: |
+          source xnu-env.sh
+          SDK="$THEOS/sdks/iPhoneOS16.5.sdk"
+          # the driver library with its compiler (ir3 for the chip the kernel names: 0x07010000 on garnet)
+          make -C hakios-metal ios MESA=1 HAKIOS="$PWD" -j"$(nproc)"
+          llvm-nm -g hakios-metal/out/ios/libhakios-metal.a | grep -q ' U _air_' || {
+            echo "::error::libhakios-metal.a was built without its compiler (MESA=1)"; exit 1; }
+          # the plug-in: userland/src/HakiosMetalCA.m over it, linked as userland/build.sh METAL_PLUGIN=ca links it,
+          # with RedwoodMetalDevice (the kernel's default MetalPluginClassName) as an alias of its device class
+          MB=xnu-deps/build/mesa/build-softpipe-freedreno
+          MESA_LIBS=""
+          for a in src/compiler/air/libair.a src/freedreno/ir3/libfreedreno_ir3.a src/freedreno/isa/libir3encode.a \
+              src/freedreno/isa/libir3decode.a src/compiler/isaspec/libisaspec.a src/compiler/nir/libnir.a \
+              src/compiler/libcompiler.a src/freedreno/fdl/libfreedreno_layout.a \
+              src/freedreno/common/libfreedreno_common.a src/util/libmesa_util.a src/util/libmesa_util_sse41.a \
+              src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a; do
+            [ -f "$MB/$a" ] && MESA_LIBS="$MESA_LIBS $MB/$a"
+          done
+          mkdir -p out/metal
+          xnu-clang -arch arm64 -isysroot "$SDK" -O1 -bundle \
+            -framework Foundation -framework IOKit -framework IOSurface -framework Metal -lobjc \
+            -DHAKIOS_METAL_GPU -Ihakios-metal/include \
+            -o out/metal/RedwoodMetal userland/src/HakiosMetalCA.m userland/src/HakiosMetalAlias.m \
+            hakios-metal/out/ios/libhakios-metal.a $MESA_LIBS -lc++ -lz -lm \
+            -Wl,-U,_native_bridge_metal_open -Wl,-U,_native_bridge_metal_first_problem -Wl,-U,_native_bridge_metal_status -Wl,-U,_native_bridge_metal_formats -Wl,-U,_native_bridge_metal_variant_hook  # UniXNU's m2v bridge (weak, not linked here: NULL)
+          llvm-nm out/metal/RedwoodMetal | grep -E 'OBJC_CLASS_\$_(HakiosMetalDevice|RedwoodMetalDevice)$'
+          [ "$(llvm-nm out/metal/RedwoodMetal | grep -E '_OBJC_CLASS_\$_(HakiosMetalDevice|RedwoodMetalDevice)$' | grep -vc ' U ')" = 2 ] || {
+            echo "::error::the plug-in does not define both HakiosMetalDevice and RedwoodMetalDevice"; exit 1; }
+          ls -l out/metal/RedwoodMetal
+          # the service stub launchd starts for the lookups garnet's widgets retry (com.redwood.svcstub.plist)
+          xnu-clang -arch arm64 -isysroot "$SDK" -O2 -o out/metal/sleepd_stub userland/src/sleepd_stub.c
+          ls -l out/metal/sleepd_stub
+
+      - name: Assemble root.apfs (device image + this build's Metal plug-in and Mesa)
+        run: |
+          BASE=devices/garnet/userland/root.apfs
+          test -f "$BASE"
+          mkdir -p out/root
+          bash tools/garnet-root-apfs.sh "$BASE" out/root/root.apfs \
+            --plugin out/metal/RedwoodMetal \
+            --plugin-plist userland/src/RedwoodMetal-garnet.plist \
+            --osmesa xnu-deps/build/mesa/out/libOSMesa.8.dylib \
+            --file out/metal/sleepd_stub=/bin/sleepd_stub \
+            --file userland/src/com.redwood.svcstub.plist=/LaunchDaemons/com.redwood.svcstub.plist \
+            --manifest out/root/root.apfs.manifest
+          # an APFS container the kernel's reader takes: the superblock's magic, one volume, every checksum good
+          python3 tools/apfs/apfs.py info out/root/root.apfs
+          python3 - <<'EOF'
+          import struct
+          b = open("out/root/root.apfs", "rb").read(4096)
+          assert b[32:36] == b"NXSB", "no NXSB container superblock"
+          print("root.apfs: NXSB, block size", struct.unpack_from("<I", b, 36)[0])
+          EOF
+          python3 tools/apfs/apfs.py ls out/root/root.apfs /lib/RedwoodMetal.bundle
+
+      - name: Package Distributable Garnet Release
+        run: |
+          mkdir -p dist/payload/userland dist/payload/prebuilt
+          K="xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837"
+
+          # 1. Base prebuilts from device tree (UEFI, splash, dtb, BootShim) -- never its kernel, loader, image or root.apfs
+          if [ -d devices/garnet/prebuilt ]; then
+            cp -a devices/garnet/prebuilt/. dist/payload/prebuilt/
+          fi
+          rm -f dist/payload/prebuilt/garnet-boot.img dist/payload/prebuilt/root.apfs \
+                dist/payload/prebuilt/loader.efi dist/payload/prebuilt/mach.development.bcm2837 dist/payload/prebuilt/hakios-kernel
+          # root.apfs: the one this run assembled (device image + this build's Metal plug-in and libOSMesa)
+          cp out/root/root.apfs dist/payload/userland/root.apfs
+          cp out/root/root.apfs.manifest dist/payload/userland/root.apfs.manifest
+
+          # 2. Freshly compiled kernel & freestanding loader (guaranteed to overwrite any stale prebuilt)
+          cp "$K" dist/mach.development.bcm2837
+          cp "$K" dist/payload/prebuilt/mach.development.bcm2837
+          ln -sf mach.development.bcm2837 dist/payload/prebuilt/hakios-kernel
+          if [ -f "${K}.unstripped" ]; then
+            cp "${K}.unstripped" dist/mach.development.bcm2837.unstripped
+          fi
+          cp xnuloader/loader.efi dist/loader.efi
+          cp xnuloader/loader.efi dist/payload/prebuilt/loader.efi
+
+          # 3. Boot scripts & CLI tools
+          if [ -f devices/garnet/garnet-boot.sh ]; then
+            cp devices/garnet/garnet-boot.sh dist/payload/
+            chmod +x dist/payload/garnet-boot.sh
+          fi
+          if [ -f devices/garnet/garnet-boot.ps1 ]; then
+            cp devices/garnet/garnet-boot.ps1 dist/payload/
+          fi
+          if [ -f devices/garnet/garnet-boot.bat ]; then
+            cp devices/garnet/garnet-boot.bat dist/payload/
+          fi
+          # the boot arguments the menu's options use, each explained
+          cp devices/garnet/bootargs.md dist/payload/bootargs.md
+          if [ -f xl ]; then
+            cp xl dist/payload/
+            chmod +x dist/payload/xl
+          fi
+          if [ -f xl.ps1 ]; then
+            cp xl.ps1 dist/payload/
+          fi
+
+          # 4. Image packing tools (mkxnuimg.py in root, mkpayload.py in xnuloader)
+          cp mkxnuimg.py dist/payload/mkxnuimg.py
+          chmod +x dist/payload/mkxnuimg.py
+
+          mkdir -p dist/payload/xnuloader
+          cp xnuloader/mkpayload.py dist/payload/xnuloader/mkpayload.py
+          chmod +x dist/payload/xnuloader/mkpayload.py
+
+          # 5. Pack garnet-boot.img with the newly built loader.efi into root of payload
+          python3 xnuloader/mkpayload.py -o /tmp/usb-payload.bin loader.efi=xnuloader/loader.efi splash=dist/payload/prebuilt/splash --usb --no-version
+          python3 mkxnuimg.py -d garnet -p /tmp/usb-payload.bin -o dist/payload/garnet-boot.img
+
+          # 6. Ensure strict file deduplication
+          rm -f dist/payload/prebuilt/garnet-boot.img dist/payload/prebuilt/root.apfs
+          rm -rf dist/payload/xnu_loader
+
+          # Ramdisk placeholder
+          if [ -f "devices/garnet/userland/put system.apfs here.txt" ]; then
+            cp "devices/garnet/userland/put system.apfs here.txt" dist/payload/userland/
+          else
+            echo "Download and put the system.apfs inside this directory." > "dist/payload/userland/put system.apfs here.txt"
+          fi
+
+          # what this run built, and from what
+          {
+            echo "ios-garnet build"
+            echo "kernel repo : ${GITHUB_REPOSITORY}@${GITHUB_SHA}"
+            echo "device repo : $(git -C devices/garnet rev-parse HEAD 2>/dev/null || echo unknown)"
+            echo "run         : ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "built       : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "md5 of every file in this package:"
+            (cd dist/payload && find . -type f ! -name BUILD-INFO.txt -print0 | LC_ALL=C sort -z | xargs -0 md5sum)
+          } > dist/payload/BUILD-INFO.txt
+          cat dist/payload/BUILD-INFO.txt
+
+          # Generate clean release README
+          python3 -c "
+          readme = '''ios-garnet: iOS 16.5 on POCO X6 5G (garnet / SM7435-AB)
+          ===========================================
+
+          Included in this release package:
+          - garnet-boot.img                   : Bootable UEFI + resident loader image
+          - garnet-boot.sh                    : Linux and Termux interactive boot manager
+          - garnet-boot.bat / .ps1            : Windows boot manager
+          - bootargs.md                       : Every boot argument the menu's options use, what each value does
+          - xl / xl.ps1                       : Host fastboot communication CLI
+          - prebuilt/mach.development.bcm2837 : XNU Kernel with Garnet drivers
+          - prebuilt/loader.efi               : Standalone resident XNU loader
+          - prebuilt/device-tree.dtb          : Garnet hardware device tree
+          - prebuilt/SILICIUM_UEFI.fd         : Silicium UEFI payload
+          - userland/root.apfs                : Root filesystem, rebuilt by this run (Metal plug-in, Mesa, LaunchDaemons)
+          - userland/root.apfs.manifest       : Its file list with md5s
+          - BUILD-INFO.txt                    : Commits this was built from, md5 of every file
+          Boot options 6-9, b and d in garnet-boot.sh boot with Metal (see bootargs.md).
+          - userland/put system.apfs here.txt : Instructions for iOS system ramdisk
+
+          Quick Boot Instructions:
+          1. Boot your POCO X6 into fastboot mode (Hold Volume Down + Power).
+          2. Boot the loader environment:
+               fastboot boot garnet-boot.img
+          3. Launch the boot manager:
+               - On Linux / Termux: ./garnet-boot.sh
+               - On Windows       : double-click garnet-boot.bat (or run .\\\\garnet-boot.ps1)
+          '''
+          with open('dist/payload/README.txt', 'w') as f:
+              f.write(readme.strip() + '\\n')
+          "
+
+          # Package zip archive for GitHub Releases
+          ARCHIVE_NAME="ios-garnet-${GITHUB_REF_NAME:-$GITHUB_SHA}.zip"
+          ARCHIVE_NAME=$(echo "$ARCHIVE_NAME" | tr '/' '-')
+          cd dist/payload
+          zip -r -y "../../dist/$ARCHIVE_NAME" *
+          cd ../..
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          ls -la dist/
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-garnet
+          path: dist/payload/
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ios-garnet: iOS 16.5 on POCO X6 5G"
+          body: "Initial release"
+          files: |
+            dist/${{ env.ARCHIVE_NAME }}
+            dist/mach.development.bcm2837
+            dist/loader.efi
+          draft: false
+          prerelease: false
+          generate_release_notes: false
