@@ -379,6 +379,8 @@ hm_now(void)
 	return (double)mach_absolute_time() * timebase.numer / timebase.denom / 1e9;
 }
 
+static long hm_last_link_ms;   /* when the last pipeline began to be made (ms of hm_now): hm_spec_wait_quiet */
+
 /* --- the private base classes, by name only ---------------------------------------------------------------- */
 
 /* The designated initialisers are the ones Apple's own driver sends to super (IOGPUMetalCommandQueue,
@@ -3284,6 +3286,9 @@ hm_describe_function(id f)
 				      why:[NSString stringWithFormat:@"%@ or %@ has no bitcode", [vs name], [fs name]]];
 	}
 	format = (unsigned)[[[descriptor colorAttachments] objectAtIndexedSubscript:0] pixelFormat];
+	const double linkBegan = hm_now();   /* (how long the link took, said with it: the caller waits for it) */
+	__atomic_store_n(&hm_last_link_ms, (long)(linkBegan * 1e3), __ATOMIC_RELAXED);
+	hakios_metal_compile_stats(NULL, NULL, NULL, NULL);
 	{
 		hakios_metal_constant vsConstants[64], fsConstants[64];
 		unsigned vsCount = hm_function_constants(vs, vsConstants, 64), fsCount = hm_function_constants(fs, fsConstants, 64);
@@ -3382,8 +3387,14 @@ hm_describe_function(id f)
 				}
 			}
 		}
-		hm_print("linked %s (%p) for pixel format %u: the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s\n",
-			 hakios_metal_program_name(program), (void *)program, format, hakios_metal_program_resource_count(program, 0),
+		double waitMs = 0, compileMs = 0;
+		unsigned hits = 0, misses = 0;
+
+		hakios_metal_compile_stats(&waitMs, &compileMs, &hits, &misses);
+		hm_print("linked %s (%p) for pixel format %u in %.0f ms (%u fragment words; waited %.0f ms for the compiler, compiled %.0f ms, "
+			 "%u stages cached, %u compiled): the vertex stage binds %u resources, the fragment stage %u; fragment constants not 0:%s\n",
+			 hakios_metal_program_name(program), (void *)program, format, (hm_now() - linkBegan) * 1e3,
+			 hakios_metal_program_stage_words(program, 1), waitMs, compileMs, hits, misses, hakios_metal_program_resource_count(program, 0),
 			 hakios_metal_program_resource_count(program, 1), [set UTF8String]);
 	}
 	{
@@ -7618,6 +7629,27 @@ hm_spec_off(void)
 	_specMaskState = hm_spec_full() ? 2 : 0;
 }
 
+/* A specialisation (or the search for the bytes that decide) waits until no pipeline has been made for this long: the
+ * window server makes its pipelines in bursts as a new screen comes (Control Center's 22, an app's launch 7, the way
+ * home 20), each one waited for by its render thread, and a specialisation that took the compiler meanwhile held them
+ * up 200 to 440 ms. Until it is made the uber shader draws, as before. The queue's thread is background to the compiler
+ * too (hakios_metal_compile_background): it takes the compiler only while no pipeline waits for it. */
+#define HM_SPEC_QUIET_MS 400
+
+static void
+hm_spec_wait_quiet(void)
+{
+	hakios_metal_compile_background(1);
+	for (int i = 0; i < 200; i++) {   /* (20 s at most: a process that makes pipelines all the time still gets them) */
+		long last = __atomic_load_n(&hm_last_link_ms, __ATOMIC_RELAXED);
+
+		if ((long)(hm_now() * 1e3) - last >= HM_SPEC_QUIET_MS) {
+			return;
+		}
+		usleep(100 * 1000);
+	}
+}
+
 /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
  * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 s on the host, and a frame
  * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own. */
@@ -7679,6 +7711,7 @@ hm_spec_off(void)
 			unsigned char mask[256];
 			struct timespec t0, t1;
 
+			hm_spec_wait_quiet();
 			clock_gettime(CLOCK_MONOTONIC, &t0);
 			int marked = hakios_metal_program_spec_mask([_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount, (unsigned)_specBinding,
 								    _specLength, mask);
@@ -7718,6 +7751,7 @@ hm_spec_off(void)
 		dispatch_async(compiling, ^{
 			struct timespec t0, t1;
 
+			hm_spec_wait_quiet();
 			clock_gettime(CLOCK_MONOTONIC, &t0);
 			hakios_metal_program *p = hakios_metal_program_specialize_masked(_program, [_fsAir bytes], [_fsAir length], _fsConstants,
 										 _fsConstantCount, (unsigned)_specBinding, [key bytes], [key length], _specMask);

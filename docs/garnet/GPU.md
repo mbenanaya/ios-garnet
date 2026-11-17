@@ -13,6 +13,8 @@
 | Page swipes, frames over 16.7 ms | 10-11% | 1-6% |
 | Settings list scroll | 62 fps, a third of the frames late | 60 fps, none late |
 | CoreAnimation's full-screen GMEM pass | 10.7 ms | 8.0 ms |
+| Opening Control Center | 2-3 frames (the window server stalled 2.5 s) | animates, about 35 fps |
+| Opening an app, finger up to its first frame | about 330 ms | about 120 ms |
 
 ## Findings
 
@@ -52,13 +54,25 @@ copied into the panel's memory across the scan. It now reads the frame's length 
 (`INTF_VSYNC_PERIOD_F0` over the line length in `INTF_HSYNC_CTL`), accepts a counter of two counts a line, and starts
 3 s after boot instead of a minute.
 
+**Pipelines waiting for specialisations.** All shader compilations share one compiler and one lock. The plug-in
+specialises CoreAnimation's uber shaders on a background queue (200-440 ms each, the uber shader drawing meanwhile),
+while the window server makes each new pipeline on its render thread, in bursts as a screen first appears. Those waited
+behind the queue: Control Center's 22 pipelines took 2.5 s to make, 36 ms of it compiling. The lock now serves a
+waiting foreground compilation before any background one (`hakios_metal_compile_background`), and a specialisation
+starts only after 400 ms without a new pipeline. The `linked ...` log line says how long each pipeline took and how
+much of it was waiting.
+
 **Frames waiting for the panel.** The Metal boot arguments use `fb_queue=2` (the driver's default): with `fb_queue=1`
 the window server waited in its swap for the frame before it to be taken.
 
 ## Known issues
 
 - Control Center draws two full-screen passes: 35-40 fps.
-- Opening and closing apps: 30-40 fps (the first frames of a launch, and the home gesture's full-screen passes).
+- Opening and closing apps: 30-40 fps. Their frames draw some 15 full-screen layers (wallpaper, the app's snapshot,
+  backdrops), close to what the GPU can fill at 1125x2436.
+- SpringBoard spends about 100 ms on its main thread after a tap before the launch animation's first frame.
+- The first boot of a session compiles CoreAnimation's shaders anew (about 4 s before the lock screen's first frames):
+  the compiled stages are kept only with `var_store=1`.
 - The panel refreshes at 60 Hz. The boot loader runs its 120 Hz timing on a half-rate pixel clock (no adaptive
   refresh and no front porch to shorten), so 120 Hz needs the DSI clock reprogrammed.
 - `adreno_vote=1` (GMU bandwidth vote) makes the GMU fail; do not use it.

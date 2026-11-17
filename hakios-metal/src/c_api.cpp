@@ -1143,6 +1143,12 @@ hakios_metal_program* hakios_metal_program_new_bitcode(const void* vsBitcode, si
     return hakios_metal_program_new_bitcode_constants(vsBitcode, vsSize, nullptr, 0, fsBitcode, fsSize, nullptr, 0, colorPixelFormat);
 }
 
+void hakios_metal_compile_background(int on) { hakios::metal::compileBackground(on != 0); }
+
+void hakios_metal_compile_stats(double* waitMs, double* compileMs, unsigned* hits, unsigned* misses) {
+    hakios::metal::compileStats(waitMs, compileMs, hits, misses);
+}
+
 hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsBitcode, size_t vsSize, const hakios_metal_constant* vsConstants, unsigned vsCount,
                                                                  const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
                                                                  unsigned colorPixelFormat) {

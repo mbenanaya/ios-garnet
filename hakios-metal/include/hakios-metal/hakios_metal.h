@@ -298,6 +298,12 @@ int hakios_metal_program_spec_mask(const void *fs_bitcode, size_t fs_size, const
     unsigned fs_count, unsigned binding, unsigned length, unsigned char *mask);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
+/* this thread's compilations since the last call: ms waiting for the compiler (another thread's compilation holds it),
+ * ms compiling (the cache's look-ups included), stages found compiled in a cache, stages compiled; then all zeroed */
+void hakios_metal_compile_stats(double *waitMs, double *compileMs, unsigned *hits, unsigned *misses);
+/* 1: this thread's compilations are background ones -- they take the compiler only while no other thread waits for it
+ * (a specialisation's queue); 0: they wait their turn, first among waiters (the default) */
+void hakios_metal_compile_background(int on);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
 void hakios_metal_buffer_counts(unsigned *made, unsigned *reused, unsigned long long *bytes);

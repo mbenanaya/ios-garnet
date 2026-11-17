@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
+#include <atomic>
+#include <chrono>
 #include <unordered_set>
 
 #ifdef HAKIOS_METAL_MESA
@@ -35,6 +38,15 @@ std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why
 std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
+}
+
+void compileBackground(bool) {}
+
+void compileStats(double* waitMs, double* compileMs, unsigned* hits, unsigned* misses) {
+    if (waitMs) *waitMs = 0;
+    if (compileMs) *compileMs = 0;
+    if (hits) *hits = 0;
+    if (misses) *misses = 0;
 }
 
 bool knownBufferMask(const void*, size_t, const FunctionConstants&, uint32_t, uint32_t, std::vector<uint8_t>*, std::string* why) {
@@ -80,6 +92,36 @@ uint32_t compilerChip() {
 namespace {
 
 std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
+
+// The compiler for a caller that waits for it (a pipeline made on the window server's render thread) before one that
+// does not (a specialisation, made on a queue of its own while the uber shader draws: hakios_metal_compile_background).
+// One compilation at a time still; but a background one takes the compiler only while no foreground one is waiting
+// for it, and gives it back at once if one came while it took it. Without that the render thread waited out the
+// queue's compilations one after the other, 200 to 440 ms each: Control Center's 22 pipelines took 2.5 s to make, of
+// which 36 ms compiling (17 November).
+std::atomic<int> gForegroundWaiting{0};
+thread_local bool tBackground = false;
+
+class CompilerLock {
+public:
+    CompilerLock() {
+        if (!tBackground) {
+            gForegroundWaiting.fetch_add(1);
+            lock_ = std::unique_lock<std::mutex>(gCompilerLock);
+            gForegroundWaiting.fetch_sub(1);
+            return;
+        }
+        for (;;) {
+            while (gForegroundWaiting.load() > 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            lock_ = std::unique_lock<std::mutex>(gCompilerLock);
+            if (gForegroundWaiting.load() == 0) return;
+            lock_.unlock();
+        }
+    }
+
+private:
+    std::unique_lock<std::mutex> lock_;
+};
 
 // one compiler for the chip, as the kernel names it (setCompilerChip): 0x06030500 is Mesa's Adreno 7c+ Gen 3 row,
 // 0x07010000 the A710's (FD710)
@@ -1148,7 +1190,7 @@ const char* className(uint8_t element) { return element == kElemFloat ? "floats"
 bool hasCompiler() { return theCompiler() != nullptr; }
 
 std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerLock g;
     if (theCompiler() == nullptr) {
         refuse(why, "ir3 has no compiler for chip " + std::to_string(compilerChip()));
         return nullptr;
@@ -1356,9 +1398,21 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
 }
 }  // namespace
 
+// (what this thread's compilations since hakios_metal_compile_stats last asked cost: the wait for the compiler, which a
+// compilation on another thread holds, the compiling itself, and the stages a cache gave)
+thread_local double tCompileWaitMs, tCompileMs;
+thread_local unsigned tCompileHits, tCompileMisses;
+
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
                                            const KnownBuffer* known) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
+    const auto asked = std::chrono::steady_clock::now();
+    CompilerLock g;
+    const auto got = std::chrono::steady_clock::now();
+    tCompileWaitMs += std::chrono::duration<double, std::milli>(got - asked).count();
+    struct Took {
+        std::chrono::steady_clock::time_point from;
+        ~Took() { tCompileMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count(); }
+    } took{got};
     if (theCompiler() == nullptr) {
         refuse(why, "ir3 has no compiler for chip " + std::to_string(compilerChip()));
         return nullptr;
@@ -1366,7 +1420,10 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
     const std::string cached = stageCacheWritable(name);
     if (!cached.empty()) {
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) return s;
+        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) {
+            tCompileHits++;
+            return s;
+        }
     }
     if (!name.empty()) {
         const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
@@ -1375,9 +1432,13 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
             const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
             p = colon != nullptr ? colon + 1 : nullptr;
             if (dir.empty()) continue;
-            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) return s;
+            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) {
+                tCompileHits++;
+                return s;
+            }
         }
     }
+    tCompileMisses++;
     std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
     std::unique_ptr<CompiledStage> chosen;
     if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
@@ -1393,9 +1454,20 @@ std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, st
     return chosen;
 }
 
+void compileBackground(bool on) { tBackground = on; }
+
+void compileStats(double* waitMs, double* compileMs, unsigned* hits, unsigned* misses) {
+    if (waitMs) *waitMs = tCompileWaitMs;
+    if (compileMs) *compileMs = tCompileMs;
+    if (hits) *hits = tCompileHits;
+    if (misses) *misses = tCompileMisses;
+    tCompileWaitMs = tCompileMs = 0;
+    tCompileHits = tCompileMisses = 0;
+}
+
 bool knownBufferMask(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, uint32_t length,
                      std::vector<uint8_t>* mask, std::string* why) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerLock g;
     if (theCompiler() == nullptr) return refuse(why, "ir3 has no compiler for chip " + std::to_string(compilerChip()));
     Translation t;
     if (!translate(bitcode, size, t, why, constants)) return false;
@@ -1654,7 +1726,7 @@ bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::v
     // under the compilers' lock as well: the front end and theCompiler() are the same ones compileAir uses, and Resident
     // Evil 4 asks for encoders on one thread while it compiles on others -- unlocked, the same function's layout came
     // back with 23 members, then 12, its set numbers garbage, and the encoders built from it wrote nothing
-    std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerLock g;
     // the interface alone: a body the front end cannot translate yet does not keep a set's layout from being known
     Translation t;
     t.mem = ralloc_context(nullptr);

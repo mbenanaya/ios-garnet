@@ -144,6 +144,8 @@ struct KnownBuffer {
 // LENGTH bytes, 0xff for each such byte; false with the reason. What it misses is only left to draw time.
 bool knownBufferMask(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t binding, uint32_t length,
                      std::vector<uint8_t>* mask, std::string* why);
+void compileStats(double* waitMs, double* compileMs, unsigned* hits, unsigned* misses);   // (hakios_metal_compile_stats)
+void compileBackground(bool on);   // (hakios_metal_compile_background)
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
                                            uint32_t iboBase = 0, const KnownBuffer* known = nullptr);
 // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):
