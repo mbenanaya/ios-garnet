@@ -80,7 +80,8 @@ written to 2752 lines, the panel still refreshed 60 times a second, so the DSI l
 AppleARMBacklight, writing `brightness` (0 to 65536, its own fades as many steps) into its properties; with no such
 service the slider moved and nothing happened. The display driver now publishes one and sends each level to the
 panel as DCS `0x51` with an 11-bit level (2047 the most outside high-brightness mode), through the DSI controller's
-command FIFO in the frame's blanking. `fb_bl=0` keeps the service but sends nothing; `fb_bl_min=N` (default 8) is
+command FIFO, scheduled for the first line of the vertical blanking (sent at once, it went out mid-frame and the
+picture flickered and tore while the slider moved), by a thread that sends only the newest level. `fb_bl=0` keeps the service but sends nothing; `fb_bl_min=N` (default 8) is
 the lowest level sent.
 
 **Frames waiting for the panel.** The Metal boot arguments use `fb_queue=2` (the driver's default): with `fb_queue=1`

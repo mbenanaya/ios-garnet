@@ -316,7 +316,11 @@ measurePanel(__unused void * arg, __unused wait_result_t wr)
  * (0x7ff the most outside high brightness mode: mi,mdss-fac-brightness-max-level), sent here through the DSI
  * controller's command FIFO as Linux's dsi_ctrl_hw_cmn_kickoff_fifo_command() does: the packet's words into the
  * test pattern generator's DMA FIFO, embedded mode, a software trigger, and the DMA's done bit waited for. No
- * memory is read by the controller, so nothing has to be mapped for it.
+ * memory is read by the controller, so nothing has to be mapped for it. The command goes out in the vertical blanking,
+ * scheduled for the first line after the picture (DSI_DMA_SCHEDULE_CTRL, as dsi_configure_command_scheduling() does
+ * for a video mode panel): sent at once, it went out in the middle of a frame, and moving the slider made the
+ * picture flicker and tear. CoreBrightness's fades set a level every frame; the levels are sent by a thread of their
+ * own, the newest each time, so that backboardd never waits for the panel.
  *
  * Boot-arg fb_bl=0: the service, but no command sent (what it was asked for is still logged). fb_bl_min=N: the
  * lowest level ever sent (default 8: never black). fb_bl_log=N: so many of the requests are logged (default 40).
@@ -335,11 +339,15 @@ static TUNABLE(uint64_t, gBacklightDsi, "fb_bl_dsi", 0x0ae94000);
 #define DSI_REG_TPG_CTRL        0x15c
 #define DSI_REG_TPG_DMA_FIFO    0x17c
 #define DSI_REG_TPG_FIFO_RESET  0x1ec
+#define DSI_REG_DMA_SCHEDULE    0x100                   /* bit 28: the DMA waits for the line in bits 15:0 */
+#define DSI_REG_DMA_SCHEDULE2   0x104
+#define DSI_REG_VIDEO_ACTIVE_V  0x028                   /* the picture's last line in the high half */
 
 static IOLock * gBacklightLock;
 static vm_offset_t gBacklightRegs;
 static uint32_t gBacklightLevel = ~0u;          /* the level last sent */
 static uint32_t gBacklightSaid;
+static uint32_t gBacklightWanted = ~0u;         /* the newest level asked for, for the sending thread */
 
 static inline uint32_t blRead(uint32_t offset) { return *(volatile uint32_t *)(gBacklightRegs + offset); }
 static inline void blWrite(uint32_t offset, uint32_t value) { *(volatile uint32_t *)(gBacklightRegs + offset) = value; __builtin_arm_dsb(0xf); }
@@ -376,8 +384,10 @@ panelSendBrightness(uint32_t level)
 	dma |= 1u << 28;                                                /* embedded mode */
 	blWrite(DSI_REG_CMD_DMA_CTRL, dma);
 	blWrite(DSI_REG_DMA_CMD_LENGTH, 8);
+	/* the first line after the picture (DSI_VIDEO_MODE_ACTIVE_V's end, as the controller counts) */
+	blWrite(DSI_REG_DMA_SCHEDULE, (1u << 28) | (((blRead(DSI_REG_VIDEO_ACTIVE_V) >> 16) + 1) & 0xffff));
 	blWrite(DSI_REG_CMD_DMA_SW_TRIG, 1);
-	for (int i = 0; i < 400 && !done; i++) {                        /* (a frame at most: it goes out in the blanking) */
+	for (int i = 0; i < 800 && !done; i++) {                        /* (a frame and a bit: it waits for its line) */
 		done = blRead(DSI_REG_INT_CTRL) & 1;
 		if (!done) {
 			IODelay(50);
@@ -386,6 +396,8 @@ panelSendBrightness(uint32_t level)
 	if (done) {
 		blWrite(DSI_REG_INT_CTRL, (blRead(DSI_REG_INT_CTRL) & ~((1u << 24) | (1u << 28))) | 1u);   /* the done bit cleared, errors left */
 	}
+	blWrite(DSI_REG_DMA_SCHEDULE2, 0);
+	blWrite(DSI_REG_DMA_SCHEDULE, 0);
 	blWrite(DSI_REG_TPG_CTRL, 0);
 	blWrite(DSI_REG_TPG_FIFO_RESET, 1);
 	IODelay(1);
@@ -431,16 +443,15 @@ AppleARMBacklight::apply(double fraction, const char * from)
 	level = (uint32_t) (fraction * BL_LEVEL_MAX + 0.5);
 	level = level < min ? min : level;
 	IOLockLock(gBacklightLock);
-	if (level != gBacklightLevel && gBacklight) {
-		sent = panelSendBrightness(level);
-		if (sent) {
-			gBacklightLevel = level;
-		}
+	sent = gBacklight != 0 && level != gBacklightWanted;
+	gBacklightWanted = level;
+	if (sent) {
+		IOLockWakeup(gBacklightLock, &gBacklightWanted, true);
 	}
 	IOLockUnlock(gBacklightLock);
 	if (gBacklightSaid < gBacklightLog) {
 		gBacklightSaid++;
-		IOLog("MiniIOMobileFramebuffer: backlight: %s %u/2047 from %s (%u %%)%s\n", sent ? "sent" : "not sent", level, from,
+		IOLog("MiniIOMobileFramebuffer: backlight: %s %u/2047 from %s (%u %%)%s\n", sent ? "to send" : "not sent", level, from,
 		    (uint32_t) (fraction * 100 + 0.5), gBacklight ? "" : " (fb_bl=0)");
 	}
 }
@@ -473,10 +484,33 @@ AppleARMBacklight::setProperties(OSObject * properties)
 		return kIOReturnSuccess;
 	}
 	if (blNumber(dict->getObject("brightness"), &value)) {
-		apply(value <= 1 ? value : value / 65536, "brightness");
+		apply(value / 65536, "brightness");   /* (out of 65536: the slider's bottom is 1 or so, not a fraction) */
 		return kIOReturnSuccess;
 	}
 	return kIOReturnSuccess;        /* (unknown keys: taken and said, nothing done) */
+}
+
+/* the newest level asked for, sent in the next blanking; a command that did not go out is tried with the next level */
+static void
+backlightThread(__unused void * arg, __unused wait_result_t wr)
+{
+	uint32_t failed = 0;
+
+	for (;;) {
+		uint32_t level;
+
+		IOLockLock(gBacklightLock);
+		while (gBacklightWanted == gBacklightLevel || gBacklightWanted == ~0u) {
+			IOLockSleep(gBacklightLock, &gBacklightWanted, THREAD_UNINT);
+		}
+		level = gBacklightWanted;
+		gBacklightLevel = level;                /* (sent or not, not again for the same level: the next one tries) */
+		IOLockUnlock(gBacklightLock);           /* (apply() never waits for the panel) */
+		if (!panelSendBrightness(level) && failed++ < 4) {
+			IOLog("MiniIOMobileFramebuffer: backlight: level %u did not go out (DSI ctrl %#x, interrupts %#x)\n", level,
+			    gBacklightRegs ? blRead(DSI_REG_CTRL) : 0, gBacklightRegs ? blRead(DSI_REG_INT_CTRL) : 0);
+		}
+	}
 }
 
 /* the service, under the framebuffer: matched by CoreBrightness before backboardd draws */
@@ -495,6 +529,14 @@ backlightPublish(IOService * provider)
 		return;
 	}
 	gBacklightLock = IOLockAlloc();
+	{
+		thread_t thread;
+
+		if (gBacklight && panel_thread_start(backlightThread, NULL, &thread) == KERN_SUCCESS) {
+			thread_set_thread_name(thread, "the panel's brightness");
+			thread_deallocate(thread);
+		}
+	}
 	n = OSNumber::withNumber(0ULL, 32); brightness->setObject("min", n); n->release();
 	n = OSNumber::withNumber(65536ULL, 32); brightness->setObject("max", n); n->release();
 	n = OSNumber::withNumber(32768ULL, 32); brightness->setObject("value", n); n->release();
