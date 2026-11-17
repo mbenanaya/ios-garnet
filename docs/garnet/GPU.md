@@ -8,6 +8,7 @@
 | Home-screen page swipes | about 36 fps | 62-68 fps |
 | GMEM (tile) rendering | hung (SMMU fault at address 0) | works |
 | Rearrange-mode delete badges, "Done" label | dark green squares, a dark box | round grey badges, plain text |
+| Fast page swipes with GMEM | coloured blocks beside moving icons | clean |
 
 ## Findings
 
@@ -29,11 +30,14 @@ green) got `..._Ialp`, `..._Isrg` (grey and alpha in RG8, read r r r g) got `...
 drew as opaque squares. The plug-in now binds such an image through a texture swizzle that turns the stand-in's read
 into the one asked for (`hm_input_swizzle` in `userland/src/HakiosMetalCA.m`).
 
+**GMEM loads and framebuffer fetch.** On A7xx a tile's load (an event blit) stays in the blit cache until a
+`CCU_RESOLVE_CLEAN`. A framebuffer fetch reads GMEM through UCHE, so before that event it read the bin as the previous
+tile left it: during page swipes, blocks of the right tile column one tile row up showed in the left column. Each
+tile whose draws read their target now sends `CCU_RESOLVE_CLEAN` after its loads, before the cache invalidate (as
+turnip's `TU_CMD_FLAG_BLIT_CACHE_CLEAN`).
+
 ## Known issues
 
-- Coloured blocks during fast page swipes, only with GMEM, near the seam between two tile columns (around x = 470-580
-  of 1125): last frame's pixels left in place. The system-memory path is clean; the hardware's binning (visibility)
-  is not the cause.
 - Control Center draws two full-screen passes: 35-40 fps.
 - `adreno_vote=1` (GMU bandwidth vote) makes the GMU fail; do not use it.
 

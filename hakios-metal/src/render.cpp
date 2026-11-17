@@ -2625,8 +2625,13 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
             }
             // A framebuffer fetch reads GMEM through the texture caches, which still hold what the last tile's fetches
             // read at the same GMEM addresses (probe "GMEM: framebuffer fetch": 9221 pixels of 24 tiles from the tile
-            // before): dropped once a tile, the loads waited for first
+            // before): dropped once a tile, the loads waited for first. On the A7xx the loads' (and Clears') event
+            // blits also sit in the blit cache until a CCU_RESOLVE_CLEAN puts them in GMEM, and a read through the
+            // UCHE before that sees the bin as the tile before left it (turnip's TU_CMD_FLAG_BLIT_CACHE_CLEAN for GMEM
+            // input attachments). Without it SpringBoard's page swipes showed, in the left column, pieces of the
+            // right column one tile row up: a fetching draw's dst read from the previous tile.
             if (fetch) {
+                if (a7) event(stream, vgt_event_type(a7xx::A7XX_CCU_RESOLVE_CLEAN));
                 stream.waitForIdle();
                 event(stream, CACHE_INVALIDATE);
             }
