@@ -9,6 +9,10 @@
 | GMEM (tile) rendering | hung (SMMU fault at address 0) | works |
 | Rearrange-mode delete badges, "Done" label | dark green squares, a dark box | round grey badges, plain text |
 | Fast page swipes with GMEM | coloured blocks beside moving icons | clean |
+| Frames on the panel | copied across the line being scanned (torn) | written behind the scan |
+| Page swipes, frames over 16.7 ms | 10-11% | 1-6% |
+| Settings list scroll | 62 fps, a third of the frames late | 60 fps, none late |
+| CoreAnimation's full-screen GMEM pass | 10.7 ms | 8.0 ms |
 
 ## Findings
 
@@ -36,9 +40,27 @@ tile left it: during page swipes, blocks of the right tile column one tile row u
 tile whose draws read their target now sends `CCU_RESOLVE_CLEAN` after its loads, before the cache invalidate (as
 turnip's `TU_CMD_FLAG_BLIT_CACHE_CLEAN`).
 
+**Constant copies in tiles.** CoreAnimation binds its uniforms at 8-byte offsets, which `CP_LOAD_STATE6` cannot load
+from, so for each such draw the command processor copies them into the draw's own table and waits for the copy
+(`CP_WAIT_MEM_WRITES`, `CP_WAIT_FOR_ME`). In a GMEM pass that copy and its waits ran again in every tile. They now run
+once before the tiles (`encodeInPass`'s `hoisted` stream); `metal_gmem_off=8192` puts them back in the draws.
+
+**The panel's scan.** The boot loader leaves the panel (its 120 Hz timing, 2752 lines a frame) refreshing 60 times a
+second, and the display interface's line counter counts each line twice (up to 5504). The display driver's tear-free
+mode (`fb_beam`: frames written behind the line being scanned) refused that counter and stayed off, so every frame was
+copied into the panel's memory across the scan. It now reads the frame's length from the interface's registers
+(`INTF_VSYNC_PERIOD_F0` over the line length in `INTF_HSYNC_CTL`), accepts a counter of two counts a line, and starts
+3 s after boot instead of a minute.
+
+**Frames waiting for the panel.** The Metal boot arguments use `fb_queue=2` (the driver's default): with `fb_queue=1`
+the window server waited in its swap for the frame before it to be taken.
+
 ## Known issues
 
 - Control Center draws two full-screen passes: 35-40 fps.
+- Opening and closing apps: 30-40 fps (the first frames of a launch, and the home gesture's full-screen passes).
+- The panel refreshes at 60 Hz. The boot loader runs its 120 Hz timing on a half-rate pixel clock (no adaptive
+  refresh and no front porch to shorten), so 120 Hz needs the DSI clock reprogrammed.
 - `adreno_vote=1` (GMU bandwidth vote) makes the GMU fail; do not use it.
 
 ## Arguments

@@ -302,6 +302,10 @@ measurePanel(__unused void * arg, __unused wait_result_t wr)
 	    "(frames are made at %u a second: fb_hz)\n", (on & 1) ? "on" : "OFF", second - first, refreshHz());
 }
 
+/* the interface's frame, for fb_beam: the line's length (high half) and the frame's (lines times the line's length) */
+#define INTF_HSYNC_CTL          0x008
+#define INTF_VSYNC_PERIOD_F0    0x00c
+
 static inline uint32_t
 refreshHz(void)
 {
@@ -383,7 +387,8 @@ public:
 	 */
 	uint64_t        fBeat;                  /* the beat the last frame was shown on */
 	vm_offset_t     fBeamIntf;              /* fb_beam: the DSI interface's registers, once they were seen to count */
-	uint32_t        fBeamLines;             /* ... lines of a scan, blanking included */
+	uint32_t        fBeamLines;             /* ... lines of a scan, blanking included (in the line counter's counts) */
+	uint32_t        fBeamScale;             /* ... the line counter's counts a line: 2 on garnet, 1 elsewhere */
 	uint64_t        fBeamPeriod;            /* ... how long a scan takes */
 	uint64_t        fBeamScan;              /* ... when the scan that shows the frame being written begins */
 	uint64_t        fBeamShare;             /* ... how long a thread's share of the rows takes to write */
@@ -953,10 +958,15 @@ void
 IOMobileFramebuffer::beamProbe(void)
 {
 	vm_offset_t intf;
-	uint32_t first, frames, line, lines = 0, smallest = ~0u;
-	uint64_t began, ended, until;
+	uint32_t first, frames, line, lines = 0, smallest = ~0u, hsync, frameLines, scale = 1;
+	uint64_t began, ended, until, started = mach_absolute_time();
+	char said[256];
 
-	IOSleep(60000);
+	/*
+	 * A few seconds in, not a minute: frames written before it are written whenever their beat comes, across the line
+	 * being read (torn). Its line is said again a minute in, where the phone's log keeps it.
+	 */
+	IOSleep(3000);
 	intf = panelInterface();
 	if (intf == 0) {
 		IOLog("MiniIOMobileFramebuffer: fb_beam: no display interface known for this SoC (fb_intf=): frames stay on their beat\n");
@@ -989,18 +999,40 @@ IOMobileFramebuffer::beamProbe(void)
 	}
 	ended = mach_absolute_time();
 	frames = *(volatile uint32_t *)(intf + INTF_FRAME_COUNT) - first;
-	if (frames == 0 || lines < fPanelHeight || lines > fPanelHeight * 2 || smallest > fPanelHeight / 4) {
-		IOLog("MiniIOMobileFramebuffer: fb_beam: the interface's counters do not count as they should (%u frames, lines %u to %u): "
-		    "frames stay on their beat\n", frames, smallest, lines);
-		return;
+	/*
+	 * The interface's own frame, from its registers (INTF_VSYNC_PERIOD_F0 over the line's length in INTF_HSYNC_CTL). garnet's
+	 * line counter goes to 5504 in a frame of 2752 lines (the panel's 120 Hz timing, which its boot loader runs at 60 a
+	 * second): two counts a line. A counter whose top is a whole number of times the frame's lines counts in those parts
+	 * of a line; the rows are placed by it (fBeamScale).
+	 */
+	hsync = *(volatile uint32_t *)(intf + INTF_HSYNC_CTL) >> 16;
+	frameLines = hsync != 0 ? *(volatile uint32_t *)(intf + INTF_VSYNC_PERIOD_F0) / hsync : 0;
+	if (frameLines >= fPanelHeight && frameLines <= fPanelHeight * 2) {
+		uint32_t s = (lines + frameLines / 2) / frameLines;
+
+		if (s >= 1 && s <= 4 && lines + 2 * s >= s * frameLines && lines <= s * frameLines + 2 * s) {
+			scale = s;
+		}
 	}
-	fBeamLines = lines + 1;
-	fBeamPeriod = (ended - began) / frames;
-	absolutetime_to_nanoseconds(fBeamPeriod, &began);
-	IOLog("MiniIOMobileFramebuffer: fb_beam: the panel's scan is %u lines, %llu us: frames are written behind it from now on\n",
-	    fBeamLines, began / NSEC_PER_USEC);
-	__atomic_thread_fence(__ATOMIC_RELEASE);
-	fBeamIntf = intf;
+	if (frames == 0 || lines / scale < fPanelHeight || lines / scale > fPanelHeight * 2 || smallest > fPanelHeight / 4) {
+		snprintf(said, sizeof(said), "the interface's counters do not count as they should (%u frames, lines %u to %u, "
+		    "a frame of %u lines): frames stay on their beat", frames, smallest, lines, frameLines);
+	} else {
+		fBeamLines = lines + 1;
+		fBeamScale = scale;
+		fBeamPeriod = (ended - began) / frames;
+		absolutetime_to_nanoseconds(fBeamPeriod, &began);
+		snprintf(said, sizeof(said), "the panel's scan is %u counts (%u a line, a frame of %u lines), %llu us: frames are "
+		    "written behind it from now on", fBeamLines, fBeamScale, frameLines, began / NSEC_PER_USEC);
+		__atomic_thread_fence(__ATOMIC_RELEASE);
+		fBeamIntf = intf;
+	}
+	IOLog("MiniIOMobileFramebuffer: fb_beam: %s\n", said);
+	absolutetime_to_nanoseconds(mach_absolute_time() - started, &until);
+	if (until < 62 * NSEC_PER_SEC) {
+		IOSleep((uint32_t) ((62 * NSEC_PER_SEC - until) / NSEC_PER_MSEC));
+	}
+	IOLog("MiniIOMobileFramebuffer: fb_beam (said at %u s): %s\n", 3, said);
 }
 
 /* When the next scan the frame can be whole for begins: the first share has to be written before that scan reaches it. */
@@ -1037,7 +1069,7 @@ IOMobileFramebuffer::beamWait(const struct RowJob * job, int32_t lastRow)
 {
 	if (job->scan != 0) {
 		/* (the lines of the blanking are counted before the first row, as far as one can tell: taken as a margin either way) */
-		uint64_t lines = (uint64_t) lastRow + (fBeamLines - fPanelHeight);
+		uint64_t lines = (uint64_t) lastRow * fBeamScale + (fBeamLines - fPanelHeight * fBeamScale);
 		uint64_t passed = job->scan - fBeamPeriod + fBeamPeriod * lines / fBeamLines;
 
 		if (mach_absolute_time() < passed) {
@@ -1055,9 +1087,9 @@ IOMobileFramebuffer::beamShareDone(const struct RowJob * job, unsigned share, in
 	__atomic_fetch_add(&fStatShareTime[share], now - began, __ATOMIC_RELAXED);
 	__atomic_fetch_add(&fStatShares[share], 1, __ATOMIC_RELAXED);
 	if (job->scan != 0) {
-		uint64_t blank = fBeamLines - fPanelHeight;
-		uint64_t top = job->scan + fBeamPeriod * ((uint64_t) firstRow + blank) / fBeamLines;
-		uint64_t bottom = job->scan + fBeamPeriod * ((uint64_t) lastRow + blank) / fBeamLines;
+		uint64_t blank = fBeamLines - fPanelHeight * fBeamScale;
+		uint64_t top = job->scan + fBeamPeriod * ((uint64_t) firstRow * fBeamScale + blank) / fBeamLines;
+		uint64_t bottom = job->scan + fBeamPeriod * ((uint64_t) lastRow * fBeamScale + blank) / fBeamLines;
 
 		if (began > top || now > bottom) {
 			__atomic_fetch_add(&fStatShareTorn[share], 1, __ATOMIC_RELAXED);
