@@ -163,7 +163,9 @@ public:
                       kGmemNoTileWfi = 1024,
                       // 2048: each draw's state as a draw state group (CP_SET_DRAW_STATE), which a tile loads only for
                       // the draws its visibility stream lets through, as turnip's draw_cs has it
-                      kGmemDrawGroups = 2048 };   // no wait for idle after each tile's stores (a measure)
+                      kGmemDrawGroups = 2048,
+                      // 8192: each draw's constant copies in the draw, made again in every tile, as before 17 November
+                      kGmemCopiesInTiles = 8192 };   // no wait for idle after each tile's stores (a measure)
     void setGmemOff(uint32_t bits) { gmemOff_ = bits; }
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
     // pass can have it: what the plug-in asks; off by default, so that a test gets the mode it asks for
@@ -281,6 +283,7 @@ private:
         bool gmem = false;
         render::GmemPlan plan;
         pm4::Stream bodies;
+        pm4::Stream copies;         // the draws' constant copies, made once before the tiles (encodeInPass's HOISTED)
         // (kGmemDrawGroups) the draws' state words, put after BODIES in the pass's buffer, and where in BODIES each
         // CP_SET_DRAW_STATE is whose address closePass fills in: { index of its header in BODIES, offset in GROUP_WORDS }
         std::vector<uint32_t> groupWords;

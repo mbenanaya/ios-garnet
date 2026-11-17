@@ -576,11 +576,14 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
                  const Options& options = Options{}, uint32_t skipClears = 0);
 // (GMEM: the pass's plan when it is drawn in tiles -- the attachments' bins in RB_MRT's BASE_GMEM, a framebuffer fetch
 // reading its bin in GMEM; nullptr in sysmem. AFTER_FETCH: the draw before it in the pass read its attachments too, so
-// in raster order a fetch needs no barrier)
+// in raster order a fetch needs no barrier. HOISTED: where the draw's constant copies go -- the command processor's copy
+// of a range bound where CP_LOAD_STATE6 cannot read it, into the draw's own table -- to be made once before a GMEM pass's
+// tiles, with one wait after them all, instead of in the draw, with its waits, which every tile replays; nullptr: in
+// the draw)
 bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw,
                   const Bindings& vsBindings, const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram,
                   uint64_t table, uint8_t* tableCpu, std::string* why, const Options& options = Options{}, const GmemPlan* gmem = nullptr,
-                  bool afterFetch = false);
+                  bool afterFetch = false, pm4::Stream* hoisted = nullptr);
 void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& options = Options{});
 
 // A pass with no draw: the batch start, the pass begin, the Clear's fill, the tail. What -[MTLRenderCommandEncoder

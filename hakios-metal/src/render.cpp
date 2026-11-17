@@ -1334,7 +1334,7 @@ namespace {
 // the pass's table, which the batch start pointed the border colours at and the tail writes, is the pass's)
 bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                 const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
-                const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
+                const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false, pm4::Stream* hoisted = nullptr) {
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
@@ -1846,10 +1846,17 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         for (const PushedRange& r : ranges) {
             if (r.copy) {
                 // (the copy landed before the load reads it: CP_WAIT_MEM_WRITES, then the micro engine caught up, as
-                // turnip waits after its own CP_MEM_TO_MEM)
-                stream.memcpy(table + r.copyAt, r.from, r.units * 4);
-                stream.packet(pm4::kWaitMemWrites, nullptr, 0);
-                stream.waitForMe();
+                // turnip waits after its own CP_MEM_TO_MEM.) In a GMEM pass the copy is made once before the tiles
+                // (HOISTED, closePass), into this draw's own table: in the draw, every tile made it again and waited
+                // twice -- CoreAnimation binds its uniforms at multiples of 8, so most of its draws copy, and a tile's
+                // replay of 81 draws took some 4.8 us a draw (20 ms a 52-tile pass)
+                if (hoisted != nullptr) {
+                    hoisted->memcpy(table + r.copyAt, r.from, r.units * 4);
+                } else {
+                    stream.memcpy(table + r.copyAt, r.from, r.units * 4);
+                    stream.packet(pm4::kWaitMemWrites, nullptr, 0);
+                    stream.waitForMe();
+                }
                 loadIndirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, table + r.copyAt);
             } else if (!r.words.empty()) {
                 loadDirect(stream, s, ST6_CONSTANTS, r.offsetVec4, r.units, r.words.data(), uint32_t(r.words.size()));
@@ -2227,8 +2234,9 @@ bool encode(pm4::Stream& stream, const Program& program, const RenderPass& pass,
 
 bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                   const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
-                  const Options& o, const GmemPlan* gmem, bool afterFetch) {
-    return encodeDraw(stream, program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, table, tableCpu, why, o, false, gmem, afterFetch);
+                  const Options& o, const GmemPlan* gmem, bool afterFetch, pm4::Stream* hoisted) {
+    return encodeDraw(stream, program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, table, tableCpu, why, o, false, gmem, afterFetch,
+                      hoisted);
 }
 
 bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o, uint32_t skipClears) {
@@ -3188,8 +3196,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     const bool fetchBarrier = fetchDraw && encodeOptions.fbReadBarrier && (!fetchOrdered || !(joins && open_->lastFetched));
     // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
     if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
+    pm4::Stream copies;   // (a GMEM draw's constant copies, made once before the pass's tiles: closePass)
+    const bool hoist = gmem && !(gmemOff_ & kGmemCopiesInTiles);
     if (!render::encodeInPass(body, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), table.contents(), &why, encodeOptions,
-                              gmem ? &plan : nullptr, joins && open_->lastFetched)) {
+                              gmem ? &plan : nullptr, joins && open_->lastFetched, hoist ? &copies : nullptr)) {
         gmemClears_ = 0;
         return refuseWork(why);
     }
@@ -3261,6 +3271,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             if (program.fs.k.textures[i].fbTarget != 0) open_->read |= 1u << (program.fs.k.textures[i].fbTarget - 1u);
         }
     }
+    if (open_->gmem && copies.size() != 0) appendStream(open_->copies, copies);
     open_->lastFetched = program.fs.fbRead != 0;
     open_->lastVs = vsProgram;
     open_->lastFs = fsProgram;
@@ -3564,6 +3575,14 @@ void CommandBuffer::closePass() {
             use(*v, true);
             keep(v);
             vsc = v->gpuAddress();
+        }
+        // the draws' constant copies, once for all the tiles, and one wait for them all (encodeInPass's HOISTED)
+        if (open_->copies.size() != 0) {
+            pm4::Stream wait;
+            appendStream(stream_, open_->copies);
+            wait.packet(pm4::kWaitMemWrites, nullptr, 0);
+            wait.waitForMe();
+            appendStream(stream_, wait);
         }
         pm4::Stream tiles;
         render::Options tileOptions = open_->options;
