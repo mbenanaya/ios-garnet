@@ -260,16 +260,13 @@ jobs:
       - name: Compile the userland programs (prebuilt/userland, for a local build.sh without the toolchain)
         run: |
           source xnu-env.sh
-          # as userland/build.sh compiles them when ld64 is there
-          CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
-          LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
-          O=dist/payload/prebuilt/userland; mkdir -p $O out/userland
-          $CC $LD -o $O/hello userland/src/hello.c
-          $CC -Iuserland/libmini -c userland/libmini/mini.c -o out/userland/mini.o
-          $CC -c userland/libmini/start.S -o out/userland/start.o
-          for prog in init child stage0 var_store; do
-            $CC -Iuserland/libmini $LD -o $O/$prog userland/src/$prog.c out/userland/mini.o out/userland/start.o
-          done
+          # without ld64 build.sh would fall back to prebuilt/ itself and compile nothing
+          command -v ld64
+          # every program a local PREBUILT build.sh copies (the static ones and those linked against the SDK)
+          PROGRAMS_ONLY=1 userland/build.sh
+          O=dist/payload/prebuilt/userland; mkdir -p $O
+          cp userland/hello $O/
+          find userland/obj -maxdepth 1 -type f ! -name '*.o' ! -name '*.h' ! -name '*.new' -exec cp {} $O/ \;
           ls -l $O
 
       - name: Package Distributable Garnet Release

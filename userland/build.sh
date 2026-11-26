@@ -191,7 +191,8 @@ if [ -d hakios-metal-cache ] && [ -n "$(ls hakios-metal-cache 2>/dev/null)" ]; t
 	cp -r hakios-metal-cache root/share/
 	echo "build.sh: $(ls hakios-metal-cache | wc -l | tr -d ' ') compiled Metal stages seeded into /redwood/share/hakios-metal-cache"
 fi
-if [ -d $DARWIN/rootfs/usr/lib ]; then
+# PROGRAMS_ONLY=1: compile the programs into obj/ and stop (CI, which has the SDK but not the IPSW, ships them as prebuilt/userland)
+if [ -d $DARWIN/rootfs/usr/lib ] || [ -n "$PROGRAMS_ONLY" ]; then
 	if [ -z "$PREBUILT" ]; then
 		# ordinary dynamically linked programs of our own, built against the Darwin SDK
 		$DYN -o obj/hello_dyn src/hello_dyn.c
@@ -346,6 +347,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			fi
 		fi
 	fi
+	[ -n "$PROGRAMS_ONLY" ] && exit 0
 	cp obj/hello_dyn obj/svc_test obj/surf_test obj/rwtouch obj/mg_test root/bin/
 	[ -f obj/cpu_test ] && cp obj/cpu_test root/bin/        # (a prebuilt/ from before this program has none)
 	[ -f obj/cputop ] && cp obj/cputop root/bin/
