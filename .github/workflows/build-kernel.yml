@@ -133,6 +133,15 @@ jobs:
           bash xnu/apply.sh
           bash xnu-deps/setup.sh
 
+      # mk-ath10k.sh skips a download whose archive is already there (and still checks its sha256)
+      - name: Cache the Linux and FreeBSD source archives
+        uses: actions/cache@v4
+        with:
+          path: |
+            xnu-deps/build/ath10k/linux-*.tar.xz
+            xnu-deps/build/ath10k/freebsd-*-src.txz
+          key: ath10k-src-${{ hashFiles('tools/mk-ath10k.sh') }}
+
       - name: Build the Wi-Fi driver (Linux ath10k for the WCN3990)
         timeout-minutes: 15
         run: |
