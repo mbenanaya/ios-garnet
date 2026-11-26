@@ -134,6 +134,7 @@ jobs:
           bash xnu-deps/setup.sh
 
       - name: Build the Wi-Fi driver (Linux ath10k for the WCN3990)
+        timeout-minutes: 15
         run: |
           bash tools/mk-ath10k.sh
           ls -l xnu-deps/build/ath10k/out/ath10k.o

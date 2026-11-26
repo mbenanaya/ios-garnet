@@ -40,11 +40,13 @@ SHA256=de9999b784d2293f00d39c62d8f92a08ab8a54bc4e80ffd250a0c09cb07a0f98
 ROOT=$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)
 B=$ROOT/xnu-deps/build/ath10k
 ATH=drivers/net/wireless/ath
+# a download that stalls (under 50 kB/s for a minute) is dropped and tried again, rather than hanging the build
+CURL_STALL="--connect-timeout 30 --speed-limit 50000 --speed-time 60 --retry 5 --retry-all-errors"
 mkdir -p "$B"
 cd "$B"
 
 if [ "$(cat src/.release 2>/dev/null)" != "$VERSION $SHA256" ]; then
-	[ -f linux-$VERSION.tar.xz ] || curl -sL --fail -o linux-$VERSION.tar.xz \
+	[ -f linux-$VERSION.tar.xz ] || curl -sL --fail $CURL_STALL -o linux-$VERSION.tar.xz \
 		https://cdn.kernel.org/pub/linux/kernel/v${VERSION%%.*}.x/linux-$VERSION.tar.xz
 	echo "$SHA256  linux-$VERSION.tar.xz" | sha256sum -c --quiet
 	rm -rf src unpacked
@@ -79,7 +81,7 @@ FSYS="compat/linuxkpi sys arm64/include net net80211 netinet netinet6 vm kern to
 	contrib/ck/include contrib/dev/acpica/include contrib/libnv"
 PATCHES=$(cat "$W"/patches/*.patch 2>/dev/null | sha256sum | cut -d' ' -f1)
 if [ "$(cat freebsd/.release 2>/dev/null)" != "$FREEBSD $FREEBSD_SHA256 $PATCHES" ]; then
-	[ -f freebsd-$FREEBSD-src.txz ] || curl -sL --fail -o freebsd-$FREEBSD-src.txz \
+	[ -f freebsd-$FREEBSD-src.txz ] || curl -sL --fail $CURL_STALL -o freebsd-$FREEBSD-src.txz \
 		https://download.freebsd.org/releases/amd64/$FREEBSD-RELEASE/src.txz
 	echo "$FREEBSD_SHA256  freebsd-$FREEBSD-src.txz" | sha256sum -c --quiet
 	rm -rf freebsd gen obj
