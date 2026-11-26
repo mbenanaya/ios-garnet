@@ -195,7 +195,8 @@ jobs:
           source xnu-env.sh
           SDK="$THEOS/sdks/iPhoneOS16.5.sdk"
           # the driver library with its compiler (ir3 for the chip the kernel names: 0x07010000 on garnet)
-          make -C hakios-metal ios MESA=1 HAKIOS="$PWD" -j"$(nproc)"
+          # (the library alone: the on-device probe wants test fixtures that are not in the repository)
+          make -C hakios-metal out/ios/libhakios-metal.a MESA=1 HAKIOS="$PWD" -j"$(nproc)"
           llvm-nm -g hakios-metal/out/ios/libhakios-metal.a | grep -q ' U _air_' || {
             echo "::error::libhakios-metal.a was built without its compiler (MESA=1)"; exit 1; }
           # the plug-in: userland/src/HakiosMetalCA.m over it, linked as userland/build.sh METAL_PLUGIN=ca links it,

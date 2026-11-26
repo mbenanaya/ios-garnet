@@ -107,7 +107,8 @@ IOS_CXXFLAGS += -DHAKIOS_METAL_CACHE_BUILD='"$(IOS_CACHE_BUILD)"'
 endif
 endif
 
-out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
+# (c_api.cpp embeds null_fs's bitcode: generated here, since tests/ is not in the repository)
+out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp) tests/fixtures/null_fs_bc.hpp
 	@mkdir -p out/ios/obj
 	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
 		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
@@ -122,6 +123,7 @@ out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard
 
 # a kernel's bitcode as a header, for a probe that compiles it on the phone (our own kernels only: tools/kernels/*.ll)
 tests/fixtures/%_bc.hpp: out/host/kernels/%.bc tools/bc-header.py
+	@mkdir -p $(dir $@)
 	python3 -I tools/bc-header.py $< $* > $@
 
 clean:
