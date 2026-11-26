@@ -248,6 +248,21 @@ jobs:
           EOF
           python3 tools/apfs/apfs.py ls out/root/root.apfs /lib/RedwoodMetal.bundle
 
+      - name: Compile the userland programs (prebuilt/userland, for a local build.sh without the toolchain)
+        run: |
+          source xnu-env.sh
+          # as userland/build.sh compiles them when ld64 is there
+          CC="xnu-clang -arch arm64 -Os -static -nostdlib -ffreestanding -fno-stack-protector -fno-builtin -Wall -Wextra"
+          LD="-Wl,-e,_start -Wl,-pagezero_size,0x100000000"
+          O=dist/payload/prebuilt/userland; mkdir -p $O out/userland
+          $CC $LD -o $O/hello userland/src/hello.c
+          $CC -Iuserland/libmini -c userland/libmini/mini.c -o out/userland/mini.o
+          $CC -c userland/libmini/start.S -o out/userland/start.o
+          for prog in init child stage0 var_store; do
+            $CC -Iuserland/libmini $LD -o $O/$prog userland/src/$prog.c out/userland/mini.o out/userland/start.o
+          done
+          ls -l $O
+
       - name: Package Distributable Garnet Release
         run: |
           mkdir -p dist/payload/userland dist/payload/prebuilt
