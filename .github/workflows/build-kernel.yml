@@ -2,7 +2,7 @@ name: Build ios-garnet (kernel, Wi-Fi driver, loader)
 
 on:
   push:
-    branches: [ main, dev ]
+    branches: [ main, dev, build ]
     tags: [ 'v*' ]
   pull_request:
     branches: [ main, dev ]
