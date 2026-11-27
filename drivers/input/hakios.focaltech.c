@@ -671,7 +671,7 @@ static bool (*spi_transfer)(const uint8_t *tx, uint8_t *rx, uint32_t length);
 static uint8_t spi_tx[8 + GOODIX_MAX_READ], spi_rx[8 + GOODIX_MAX_READ];
 static uint32_t touch_address, command_address;
 static const char *report_rate = "240";        /* what the status line says (touch_rate=480) */
-static uint32_t max_x = 10800, max_y = 24000;   /* the device tree's; the chip may say otherwise */
+static uint32_t max_x = 19520, max_y = 43392;   /* garnet's 1220x2712 panel x16 (super resolution); the chip may say otherwise */
 
 static bool
 goodix_read(uint32_t address, uint8_t *data, uint32_t length)
@@ -1486,20 +1486,18 @@ focaltech_poll(void)
 enum touch_chip { TOUCH_GOODIX, TOUCH_FOCALTECH };
 static enum touch_chip touch_chip;
 
-static enum touch_chip
-touch_chip_detect(void)
-{
-	return TOUCH_FOCALTECH;
-}
-
+/* garnet ships with a Goodix GT9916S or a FocalTech FT3683G on the same pins (its device tree lists both); Goodix's check is one read, so it goes first */
 static bool
 chip_probe(bool verbose)
 {
-	if (touch_chip == TOUCH_FOCALTECH) {
-		return focaltech_probe(verbose);
-	}
+	touch_chip = TOUCH_GOODIX;
 	touch_reset();
-	return goodix_probe(verbose);
+	if (goodix_probe(verbose)) {
+		loader_log_line("focaltech: goodix chip answers\n");
+		return true;
+	}
+	touch_chip = TOUCH_FOCALTECH;
+	return focaltech_probe(verbose);
 }
 
 static void
@@ -1554,7 +1552,6 @@ bring_up(void)
 {
 	const char *why = NULL;
 
-	touch_chip = touch_chip_detect();
 	power_on();
 
 	/* Try hardware GENI SPI first */
